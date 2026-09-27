@@ -21,6 +21,36 @@ ACTION_BY_CATEGORY = {
 }
 
 
+def upsert_recommendation(
+    db: Session,
+    cluster: models.IssueCluster,
+    **fields,
+) -> models.Recommendation:
+    """
+    Create or update the single recommendation belonging to a cluster.
+
+    A dashboard polls this endpoint repeatedly, so generating a fresh row on
+    every call would grow the table without bound and give the UI an
+    ever-lengthening history of what is really one recommendation. There is
+    exactly one recommendation per cluster, refreshed in place.
+    """
+    rec = (
+        db.query(models.Recommendation)
+        .filter_by(cluster_id=cluster.id)
+        .first()
+    )
+    if rec is None:
+        rec = models.Recommendation(cluster_id=cluster.id)
+        db.add(rec)
+
+    for key, value in fields.items():
+        setattr(rec, key, value)
+
+    db.commit()
+    db.refresh(rec)
+    return rec
+
+
 def generate_recommendation(db: Session, cluster: models.IssueCluster) -> dict:
     location = db.query(models.Location).filter_by(ward=cluster.ward).first()
     location_id = location.id if location else None
@@ -68,17 +98,15 @@ def generate_recommendation(db: Session, cluster: models.IssueCluster) -> dict:
         "investment_gap": _label(invest_gap),
     }
 
-    rec = models.Recommendation(
-        cluster_id=cluster.id,
+    rec = upsert_recommendation(
+        db,
+        cluster,
         action=action,
         reason=reason,
         evidence=evidence,
         priority_score=avg_priority,
         estimated_affected_population=estimated_affected,
     )
-    db.add(rec)
-    db.commit()
-    db.refresh(rec)
 
     return {
         "cluster_id": cluster.id,
@@ -105,5 +133,12 @@ def _level(score: float) -> str:
 
 
 def generate_all(db: Session) -> list[dict]:
+    """Refresh the recommendation for every cluster. Safe to call repeatedly."""
     clusters = db.query(models.IssueCluster).all()
-    return [generate_recommendation(db, c) for c in clusters]
+    results = []
+    for c in clusters:
+        try:
+            results.append(generate_recommendation(db, c))
+        except Exception:  # noqa: BLE001 - one bad cluster must not blank the dashboard
+            db.rollback()
+    return results
