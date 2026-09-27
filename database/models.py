@@ -18,11 +18,28 @@ Base = declarative_base()
 
 
 class User(Base):
+    """
+    Mirror of a `backend/auth.py` user.
+
+    `auth.py` still keeps users in a process-local dict, and its integer ids
+    restart from 1 whenever the process restarts. That integer is therefore NOT
+    a stable identity: a later account can be handed an id an earlier account
+    already used, and keying complaint ownership on it lets that later account
+    inherit the earlier account's complaints.
+
+    `auth_key` is the stable identity. It is derived from a value that survives
+    a restart (the account's email) and is unique, so two different people can
+    never share a mirror row no matter what the auth counter does. `id` stays a
+    plain SERIAL owned by the database.
+    """
     __tablename__ = "users"
 
     id = Column(Integer, primary_key=True)
     name = Column(String(120))
     email = Column(String(255), unique=True, index=True)
+    # Stable external identity key for the auth mirror. Nullable so a row that
+    # predates this column still loads; see scripts/migrate_add_auth_key.py.
+    auth_key = Column(String(255), unique=True, index=True, nullable=True)
     role = Column(String(20), default="citizen")  # citizen | officer
     created_at = Column(DateTime, default=datetime.utcnow)
 
@@ -59,6 +76,10 @@ class Complaint(Base):
 
     text = Column(Text, nullable=False)
     language = Column(String(30))
+    # Raw free-text location exactly as the citizen typed it. `location_id` is
+    # only populated when the text resolves to a known ward, so without this
+    # column an unrecognised location would be silently discarded.
+    location_text = Column(String(200), nullable=True)
     category = Column(String(80), index=True)
     severity = Column(String(20))       # Low | Medium | High
     urgency = Column(String(20))        # Low | Medium | High

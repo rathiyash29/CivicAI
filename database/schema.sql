@@ -1,11 +1,14 @@
 -- CivicAI schema (Member 2 owned, shared tables: users, complaints)
--- Run with: psql -U civicai_user -d civicai -f schema.sql
+-- Run with: psql -U <db-user> -d civicai -f schema.sql
 -- Or just call init_db() in db.py to let SQLAlchemy create everything.
 
 CREATE TABLE IF NOT EXISTS users (
     id SERIAL PRIMARY KEY,
     name VARCHAR(120),
     email VARCHAR(255) UNIQUE,
+    -- Stable identity of the mirrored auth account. The auth module's integer
+    -- id restarts from 1 on every process restart, so it is never used here.
+    auth_key VARCHAR(255) UNIQUE,
     role VARCHAR(20) DEFAULT 'citizen',
     created_at TIMESTAMP DEFAULT NOW()
 );
@@ -36,6 +39,7 @@ CREATE TABLE IF NOT EXISTS complaints (
     cluster_id INTEGER REFERENCES issue_clusters(id),
     text TEXT NOT NULL,
     language VARCHAR(30),
+    location_text VARCHAR(200),
     category VARCHAR(80),
     severity VARCHAR(20),
     urgency VARCHAR(20),

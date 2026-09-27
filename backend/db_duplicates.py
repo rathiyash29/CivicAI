@@ -198,35 +198,78 @@ def cluster_all_unclustered(
     clusters: list[models.IssueCluster] = db.query(models.IssueCluster).all()
 
     for complaint in unclustered:
-        ward = _ward(db, complaint) or "Unassigned"
-        category = complaint.category or "Other"
-
-        # Only clusters in the same ward+category can possibly match.
-        same_scope = [c for c in clusters if c.ward == ward and c.category == category]
-        assigned = None
-
-        for cluster in same_scope[:CLUSTER_MATCH_CANDIDATES]:
-            members = db.query(models.Complaint).filter_by(cluster_id=cluster.id).all()
-            if any(similarity(complaint.text or "", m.text or "") >= threshold for m in members):
-                assigned = cluster
-                break
-
-        if assigned is None:
-            assigned = models.IssueCluster(
-                label=f"{category} - {ward} #{len(same_scope) + 1}",
-                category=category,
-                ward=ward,
-                complaint_count=0,
-                avg_severity_score=0.0,
-            )
-            db.add(assigned)
-            db.flush()  # need an id for the FK below
-            clusters.append(assigned)
-            created.append(assigned)
-
-        complaint.cluster_id = assigned.id
-        db.flush()
-        _refresh_cluster_stats(db, assigned)
+        cluster, is_new = assign_cluster(db, complaint, threshold=threshold)
+        if is_new:
+            clusters.append(cluster)
+            created.append(cluster)
 
     db.commit()
     return created
+
+
+def assign_cluster(
+    db: Session,
+    complaint: models.Complaint,
+    threshold: float = SIMILARITY_THRESHOLD,
+    commit: bool = False,
+) -> tuple[models.IssueCluster, bool]:
+    """
+    Put a single complaint into a cluster, creating one if nothing matches.
+
+    This is the request-path counterpart to `cluster_all_unclustered`. It
+    shares the same matching rule -- scope to (ward, category) first, then
+    compare by text similarity -- but it touches one complaint instead of
+    scanning the whole table, and it does not commit, so the caller controls
+    the transaction.
+
+    Returns (cluster, created_new_cluster).
+    """
+    if complaint.cluster_id:
+        existing = (
+            db.query(models.IssueCluster)
+            .filter_by(id=complaint.cluster_id)
+            .first()
+        )
+        if existing is not None:
+            return existing, False
+
+    ward = _ward(db, complaint) or "Unassigned"
+    category = complaint.category or "Other"
+
+    same_scope = (
+        db.query(models.IssueCluster)
+        .filter_by(ward=ward, category=category)
+        .order_by(models.IssueCluster.id)
+        .limit(CLUSTER_MATCH_CANDIDATES)
+        .all()
+    )
+
+    assigned = None
+    for cluster in same_scope:
+        members = db.query(models.Complaint).filter_by(cluster_id=cluster.id).all()
+        if any(similarity(complaint.text or "", m.text or "") >= threshold
+               for m in members):
+            assigned = cluster
+            break
+
+    created = False
+    if assigned is None:
+        assigned = models.IssueCluster(
+            label=f"{category} - {ward} #{len(same_scope) + 1}",
+            category=category,
+            ward=ward,
+            complaint_count=0,
+            avg_severity_score=0.0,
+        )
+        db.add(assigned)
+        db.flush()  # need an id for the FK below
+        created = True
+
+    complaint.cluster_id = assigned.id
+    db.flush()
+    _refresh_cluster_stats(db, assigned)
+
+    if commit:
+        db.commit()
+
+    return assigned, created

@@ -21,8 +21,15 @@ def app():
 
 
 @pytest.fixture
-def client(app):
-    return TestClient(app)
+def officer_headers(make_auth_user):
+    """Every intelligence endpoint is officer-only, so tests act as one."""
+    _user, token = make_auth_user("router-officer@example.com", role="officer")
+    return {"Authorization": f"Bearer {token}"}
+
+
+@pytest.fixture
+def client(app, officer_headers):
+    return TestClient(app, headers=officer_headers)
 
 
 @pytest.fixture

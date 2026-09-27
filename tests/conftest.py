@@ -18,8 +18,13 @@ if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
 _DB_FILE = os.path.join(tempfile.gettempdir(), "civicai_test_suite.db")
-if os.path.exists(_DB_FILE):
+try:
     os.remove(_DB_FILE)
+except OSError:
+    # On Windows a previous run can still hold the file briefly. That is
+    # harmless: init_db() is idempotent and the clean_db fixture truncates
+    # every table between tests.
+    pass
 os.environ["DATABASE_URL"] = "sqlite:///" + _DB_FILE.replace(os.sep, "/")
 # Keep BigQuery off so the suite can never touch the network.
 os.environ["ENABLE_BIGQUERY_SYNC"] = "false"
@@ -28,6 +33,42 @@ from database.db import SessionLocal, init_db  # noqa: E402
 from database import models  # noqa: E402
 
 init_db()
+
+
+@pytest.fixture
+def make_auth_user():
+    """
+    Create (or reuse) an in-memory auth user and return (user, token).
+
+    `backend/auth.py` keeps users in a process-local dict, so the token is the
+    only way an API test can act as a given account. Reusing an email returns
+    the existing account rather than failing, which keeps the fixture usable
+    across the whole session.
+    """
+    from backend import auth as auth_module
+    from backend.auth import UserCreate, create_user, create_access_token
+
+    def _make(email, role="citizen", name="Test User", password="password123"):
+        user = auth_module.get_user_by_email(email)
+        if user is None:
+            user = create_user(UserCreate(full_name=name, email=email,
+                                          password=password, role=role))
+        elif user.role != role:
+            user.role = role
+        token = create_access_token(data={"sub": user.email})
+        return user, token
+
+    return _make
+
+
+@pytest.fixture
+def auth_headers(make_auth_user):
+    """`Authorization` header value for a citizen, or an officer when asked."""
+    def _headers(email="fixture-citizen@example.com", role="citizen"):
+        _user, token = make_auth_user(email, role=role)
+        return {"Authorization": f"Bearer {token}"}
+
+    return _headers
 
 
 @pytest.fixture

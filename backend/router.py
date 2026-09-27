@@ -19,9 +19,14 @@ from sqlalchemy.orm import Session
 
 from database.db import get_db
 from database import models
+from backend.authorization import require_officer
 from backend import db_priority, db_duplicates, db_hotspots, recommendations, bigquery_client
 
-router = APIRouter()
+# The officer requirement is a *router-level* dependency, not a per-endpoint
+# one. It runs before every route below -- reads and mutations alike -- and any
+# endpoint added to this router in future is protected automatically instead of
+# relying on the author remembering to add a guard.
+router = APIRouter(dependencies=[Depends(require_officer)])
 
 
 def _require_complaint(db: Session, complaint_id: int) -> models.Complaint:

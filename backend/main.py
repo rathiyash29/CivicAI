@@ -1,20 +1,47 @@
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel, Field
 from typing import Literal, Optional
 from datetime import timedelta, datetime
 from enum import Enum
+import logging
+import os as _os
+import sys as _sys
 
-from ai import analyze_complaint, AI_PROVIDER
-from priority import calculate_priority, determine_factors_from_analysis
-from duplicates import check_duplicate, find_similarity, are_duplicates
-from hotspots import detect_hotspots
-from auth import (
+# --- startup compatibility -------------------------------------------------
+# This module is started two ways: `uvicorn main:app` from inside backend/ and
+# `uvicorn backend.main:app` from the repo root. The first needs backend/ on
+# sys.path, the second needs the repo root (Member 2's modules import
+# `database.*` and `backend.*`). Put the repo root on the path unconditionally
+# so package-style imports below resolve either way, and load backend/.env
+# explicitly so DATABASE_URL / GEMINI_API_KEY are found regardless of cwd.
+_REPO_ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+if _REPO_ROOT not in _sys.path:
+    _sys.path.insert(0, _REPO_ROOT)
+try:
+    from dotenv import load_dotenv as _load_dotenv
+    _load_dotenv(_os.path.join(_REPO_ROOT, "backend", ".env"))
+    _load_dotenv()
+except ImportError:
+    pass
+
+logger = logging.getLogger("main")
+
+from backend.ai import analyze_complaint, AI_PROVIDER
+from backend.priority import calculate_priority, determine_factors_from_analysis
+from backend.duplicates import check_duplicate, find_similarity, are_duplicates
+from backend.hotspots import detect_hotspots
+from backend.auth import (
     UserCreate, UserLogin, UserResponse, Token, TokenData,
-    create_user, authenticate_user, get_user_by_id, MOCK_USERS_DB,
-    create_access_token, decode_access_token, ACCESS_TOKEN_EXPIRE_MINUTES,
+    create_user, authenticate_user,
+    create_access_token, ACCESS_TOKEN_EXPIRE_MINUTES,
     UserRole
+)
+from backend import complaint_service
+from backend.authorization import (
+    get_current_user, get_current_user_optional, require_officer,
+    oauth2_scheme,
 )
 
 
@@ -45,9 +72,18 @@ COMPLAINT_ID_COUNTER = 0
 
 
 def generate_complaint_id() -> str:
+    """
+    Public id for a complaint that only exists in the in-memory fallback.
+
+    Deliberately *not* `CA-%06d`. The database issues `CA-%06d` from its own
+    primary key, and that key is not reset when the process restarts, so a
+    local counter starting at 1 would hand out CA-000001 for a second, entirely
+    different complaint. The `CA-MEM-` prefix keeps the two namespaces apart
+    while staying an ordinary opaque string for the frontend.
+    """
     global COMPLAINT_ID_COUNTER
     COMPLAINT_ID_COUNTER += 1
-    return f"CA-{COMPLAINT_ID_COUNTER:06d}"
+    return complaint_service.format_memory_complaint_id(COMPLAINT_ID_COUNTER)
 
 
 def create_complaint(
@@ -60,6 +96,13 @@ def create_complaint(
     priority_score: Optional[float] = None,
     priority_level: Optional[str] = None,
 ) -> Complaint:
+    """
+    In-memory complaint store.
+
+    PostgreSQL is the system of record; this dict is only the degraded-mode
+    fallback used when the database cannot be reached. See
+    backend/complaint_service.py.
+    """
     complaint_id = generate_complaint_id()
     now = datetime.utcnow()
     complaint = Complaint(
@@ -77,6 +120,22 @@ def create_complaint(
     )
     MOCK_COMPLAINTS_DB[complaint_id] = complaint
     return complaint
+
+
+def complaint_to_contract_dict(complaint: Complaint) -> dict:
+    return {
+        "complaint_id": complaint.complaint_id,
+        "user_id": complaint.user_id,
+        "text": complaint.text,
+        "language": complaint.language,
+        "location": complaint.location,
+        "category": complaint.category,
+        "severity": complaint.severity,
+        "priority_score": complaint.priority_score,
+        "priority_level": complaint.priority_level,
+        "status": complaint.status,
+        "created_at": complaint.created_at,
+    }
 
 
 def get_user_complaints(user_id: int) -> list[Complaint]:
@@ -101,39 +160,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login", auto_error=False)
-
-
-async def get_current_user(token: str = Depends(oauth2_scheme)) -> UserResponse:
-    credentials_exception = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Could not validate credentials",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
-    token_data = decode_access_token(token)
-    if token_data is None:
-        raise credentials_exception
-    user = get_user_by_id(int(token_data.email)) if token_data.email.isdigit() else None
-    if user is None:
-        user = next((u for u in MOCK_USERS_DB.values() if u.email == token_data.email), None)
-    if user is None:
-        raise credentials_exception
-    return UserResponse(
-        id=user.id,
-        full_name=user.full_name,
-        email=user.email,
-        role=user.role,
-        created_at=user.created_at
-    )
-
-
-async def get_current_user_optional(token: Optional[str] = Depends(oauth2_scheme)) -> Optional[UserResponse]:
-    if not token:
-        return None
-    try:
-        return await get_current_user(token)
-    except HTTPException:
-        return None
+# `get_current_user`, `get_current_user_optional`, `require_officer` and
+# `oauth2_scheme` are imported from backend.authorization (see the import block
+# at the top of this file). They live there, not here, so that the intelligence
+# router can require an officer without importing this module -- importing
+# main from router would be circular.
 
 
 class ComplaintSubmitRequest(BaseModel):
@@ -149,6 +180,9 @@ class ComplaintSubmitResponse(BaseModel):
     priority: Optional[dict] = None
     ai_provider: Optional[str] = None
     duplicate: Optional[dict] = None
+    # Additive: "postgres" | "memory". Makes the storage mode explicit so a
+    # fallback can never be mistaken for a successful write.
+    persistence: Optional[str] = None
 
 
 class AnalysisRequest(BaseModel):
@@ -246,6 +280,67 @@ async def submit_complaint(
     If not authenticated, just return the complaint data (legacy behavior).
     """
     analysis = analyze_complaint(complaint.text, complaint.language, complaint.location)
+
+    if not current_user:
+        # Unauthenticated submissions are processed but not stored. This is the
+        # pre-existing contract and is deliberately unchanged.
+        factors = determine_factors_from_analysis(analysis)
+        priority = calculate_priority(
+            factors["citizen_demand"],
+            factors["infrastructure_gap"],
+            factors["population_impact"],
+            factors["urgency"],
+            factors["investment_gap"],
+        )
+        duplicate_result = check_duplicate(complaint.text, complaint.location)
+        return {
+            "success": True,
+            "complaint": {
+                "text": complaint.text,
+                "language": complaint.language,
+                "location": complaint.location,
+                "status": "received"
+            },
+            "analysis": analysis,
+            "priority": priority,
+            "ai_provider": AI_PROVIDER,
+            "duplicate": duplicate_result,
+            "persistence": None,
+        }
+
+    # Authenticated: persist to PostgreSQL (system of record) and run the
+    # intelligence pipeline in the same transaction.
+    stored = complaint_service.persist_complaint(
+        text_value=complaint.text,
+        language=complaint.language,
+        raw_location=complaint.location,
+        analysis=analysis,
+        user=current_user,
+    )
+
+    if stored["persistence"] == complaint_service.PERSISTENCE_POSTGRES:
+        return {
+            "success": True,
+            "complaint": stored["complaint"],
+            "analysis": analysis,
+            "priority": stored["priority"],
+            "ai_provider": AI_PROVIDER,
+            "duplicate": stored["duplicate"],
+            "persistence": complaint_service.PERSISTENCE_POSTGRES,
+        }
+
+    # Database unavailable: fall back to the in-memory store, keeping the
+    # original mock scoring and telling the caller this was not persisted.
+    logger.warning("Complaint accepted but NOT persisted to PostgreSQL: %s",
+                   stored.get("fallback_reason"))
+    fallback = create_complaint(
+        user_id=current_user.id,
+        text=complaint.text,
+        language=complaint.language,
+        location=complaint.location,
+        category=analysis.get("category"),
+        severity=analysis.get("severity"),
+    )
     factors = determine_factors_from_analysis(analysis)
     priority = calculate_priority(
         factors["citizen_demand"],
@@ -254,86 +349,57 @@ async def submit_complaint(
         factors["urgency"],
         factors["investment_gap"],
     )
-    
-    duplicate_result = check_duplicate(complaint.text, complaint.location)
-    
-    if current_user:
-        stored_complaint = create_complaint(
-            user_id=current_user.id,
-            text=complaint.text,
-            language=complaint.language,
-            location=complaint.location,
-            category=analysis.get("category"),
-            severity=analysis.get("severity"),
-            priority_score=priority.get("priority_score"),
-            priority_level=priority.get("priority_level"),
-        )
-        return {
-            "success": True,
-            "complaint": {
-                "complaint_id": stored_complaint.complaint_id,
-                "user_id": stored_complaint.user_id,
-                "text": stored_complaint.text,
-                "language": stored_complaint.language,
-                "location": stored_complaint.location,
-                "category": stored_complaint.category,
-                "severity": stored_complaint.severity,
-                "priority_score": stored_complaint.priority_score,
-                "priority_level": stored_complaint.priority_level,
-                "status": stored_complaint.status,
-                "created_at": stored_complaint.created_at.isoformat(),
-            },
-            "analysis": analysis,
-            "priority": priority,
-            "ai_provider": AI_PROVIDER,
-            "duplicate": duplicate_result,
-        }
-    
+    fallback.priority_score = priority["priority_score"]
+    fallback.priority_level = priority["priority_level"]
+
     return {
         "success": True,
-        "complaint": {
-            "text": complaint.text,
-            "language": complaint.language,
-            "location": complaint.location,
-            "status": "received"
-        },
+        "complaint": complaint_to_contract_dict(fallback),
         "analysis": analysis,
         "priority": priority,
         "ai_provider": AI_PROVIDER,
-        "duplicate": duplicate_result,
+        "duplicate": check_duplicate(complaint.text, complaint.location),
+        "persistence": complaint_service.PERSISTENCE_MEMORY,
     }
 
 
 @app.get("/complaints/my", response_model=MyComplaintsResponse)
 def get_my_complaints(current_user: UserResponse = Depends(get_current_user)):
     """
-    Get all complaints submitted by the authenticated citizen.
-    Requires valid JWT token.
+    Complaints submitted by the authenticated citizen.
+    Requires a valid JWT. Served from PostgreSQL when it is available, and
+    from the in-memory fallback store otherwise.
     """
+    rows = complaint_service.list_user_complaints(current_user)
+    if rows is not None:
+        return {"success": True, "complaints": rows, "total": len(rows)}
+
+    # PostgreSQL could not be queried. The in-memory fallback store is
+    # authoritative for complaints that never reached the database, so serve
+    # those if there are any.
+    logger.warning("Serving /complaints/my from the in-memory fallback store; "
+                   "PostgreSQL is unavailable")
     complaints = get_user_complaints(current_user.id)
-    # Sort by created_at descending (newest first)
-    complaints.sort(key=lambda c: c.created_at, reverse=True)
-    
-    return {
-        "success": True,
-        "complaints": [
-            {
-                "complaint_id": c.complaint_id,
-                "user_id": c.user_id,
-                "text": c.text,
-                "language": c.language,
-                "location": c.location,
-                "category": c.category,
-                "severity": c.severity,
-                "priority_score": c.priority_score,
-                "priority_level": c.priority_level,
-                "status": c.status,
-                "created_at": c.created_at.isoformat(),
-            }
-            for c in complaints
-        ],
-        "total": len(complaints),
-    }
+    if complaints:
+        # Sort by created_at descending (newest first)
+        complaints.sort(key=lambda c: c.created_at, reverse=True)
+        return {
+            "success": True,
+            "complaints": [complaint_to_contract_dict(c) for c in complaints],
+            "total": len(complaints),
+        }
+
+    # Neither store can answer. An empty list here would read as "you have no
+    # complaints" when the truth is "we could not check", so say so instead of
+    # returning a confident, wrong answer.
+    logger.error("PostgreSQL is unavailable and the in-memory store has nothing "
+                 "for user %s; returning 503 rather than a false empty list",
+                 current_user.email)
+    raise HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail=("Complaint storage is temporarily unavailable, so your complaints "
+                "could not be retrieved. Please try again shortly."),
+    )
 
 
 @app.post("/complaints/analyze", response_model=AnalysisResponse)
@@ -426,3 +492,34 @@ def login(user_credentials: UserLogin):
 @app.get("/auth/me", response_model=UserResponse)
 def get_current_user_info(current_user: UserResponse = Depends(get_current_user)):
     return current_user
+
+
+def mount_intelligence(target_app=FastAPI) -> None:
+    """
+    Attach Member 2's intelligence router under /intelligence.
+
+    Idempotent, so both entrypoints can call it without double-registering the
+    routes. The prefix is required rather than cosmetic: this module already
+    serves /hotspots, and mounting the intelligence router at the root would
+    shadow it.
+
+    The import is guarded on purpose. If the intelligence modules cannot be
+    imported -- a missing optional dependency, say -- the citizen-facing app
+    must still boot and serve every existing endpoint. Intelligence is an
+    add-on, not a prerequisite.
+    """
+    if getattr(target_app, "_intelligence_mounted", False):
+        return
+    try:
+        from backend.router import router as intelligence_router
+    except Exception as exc:  # noqa: BLE001 - never break the core app
+        logger.warning("Intelligence router unavailable (%s); the core API is "
+                       "unaffected and will still start.", exc)
+        return
+    target_app.include_router(
+        intelligence_router, prefix="/intelligence", tags=["intelligence"]
+    )
+    target_app._intelligence_mounted = True
+
+
+mount_intelligence(app)
