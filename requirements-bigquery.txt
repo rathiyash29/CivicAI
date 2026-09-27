@@ -1,0 +1,13 @@
+# OPTIONAL: Google BigQuery analytics for CivicAI.
+#
+# Install only if you want the BigQuery integration:
+#     pip install -r requirements-bigquery.txt
+#
+# This is NOT required to run CivicAI. Without it:
+#   * backend/bigquery_client.py still imports fine
+#   * ENABLE_BIGQUERY_SYNC defaults to false
+#   * POST /intelligence/sync/bigquery reports {"status": "disabled"}
+#
+# NOTE: a real BigQuery dataset may incur billing. Use the free tier, or skip
+# this file entirely. The core product runs at zero cost without it.
+google-cloud-bigquery==3.25.0
