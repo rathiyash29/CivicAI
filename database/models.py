@@ -19,27 +19,38 @@ Base = declarative_base()
 
 class User(Base):
     """
-    Mirror of a `backend/auth.py` user.
+    A CivicAI account, and the single source of truth for authentication.
 
-    `auth.py` still keeps users in a process-local dict, and its integer ids
-    restart from 1 whenever the process restarts. That integer is therefore NOT
-    a stable identity: a later account can be handed an id an earlier account
-    already used, and keying complaint ownership on it lets that later account
-    inherit the earlier account's complaints.
+    This table started life as a *mirror* of `backend/auth.py`'s process-local
+    dict, holding only enough to attribute complaints to a stable identity
+    (`auth_key`, derived from the email). It is now the real account table:
+    `backend/auth.py` reads and writes these rows through SQLAlchemy, so an
+    account survives a restart and a second process sees the same users.
 
-    `auth_key` is the stable identity. It is derived from a value that survives
-    a restart (the account's email) and is unique, so two different people can
-    never share a mirror row no matter what the auth counter does. `id` stays a
-    plain SERIAL owned by the database.
+    `auth_key` is still the stable identity used for complaint ownership. It is
+    derived from the email -- the one field that survives a restart -- and is
+    unique, so two people can never share a row. `id` is now a real SERIAL from
+    the database rather than a counter that restarted at 1 every process, which
+    was the original reason the two could be confused.
+
+    `password_hash` is nullable because rows created before auth was
+    database-backed have no password. Such a row cannot log in: it is a
+    complaint-ownership record for an account that lived in the old
+    process-local dict and is no longer reachable. It is never silently
+    promoted to a usable account. See scripts/migrate_add_password_hash.py.
     """
     __tablename__ = "users"
 
     id = Column(Integer, primary_key=True)
     name = Column(String(120))
     email = Column(String(255), unique=True, index=True)
-    # Stable external identity key for the auth mirror. Nullable so a row that
-    # predates this column still loads; see scripts/migrate_add_auth_key.py.
+    # Stable external identity key for complaint ownership. Set on every row
+    # auth creates, and backfilled onto legacy rows by
+    # scripts/migrate_add_auth_key.py.
     auth_key = Column(String(255), unique=True, index=True, nullable=True)
+    # bcrypt hash. Never a plaintext password, and never selected into a
+    # response model.
+    password_hash = Column(String(255), nullable=True)
     role = Column(String(20), default="citizen")  # citizen | officer
     created_at = Column(DateTime, default=datetime.utcnow)
 
@@ -160,9 +171,70 @@ class Project(Base):
     id = Column(Integer, primary_key=True)
     recommendation_id = Column(Integer, ForeignKey("recommendations.id"), nullable=True)
     title = Column(String(200))
+    # What the officer decided should be done, in their words. Distinct from
+    # `title` (a short label) and from the engine's own `Recommendation.reason`,
+    # which is never overwritten by an officer decision.
+    description = Column(Text, nullable=True)
     status = Column(String(30), default="Under Review")  # Under Review|Approved|In Progress|Completed
     officer_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+    # The decisions behind this project, oldest first. A project and its ledger
+    # are written in the same transaction, so this is never partially filled.
+    decisions = relationship(
+        "OfficerDecision",
+        back_populates="project",
+        order_by="OfficerDecision.created_at",
+    )
+
+    # Impact measurement (only for completed projects)
+    impact = relationship(
+        "ProjectImpact",
+        back_populates="project",
+        uselist=False,
+    )
+
+
+class OfficerDecision(Base):
+    """
+    Append-only record of what an officer did about a recommendation.
+
+    Needed because `projects` alone cannot carry the whole workflow:
+
+      * a REJECTION creates no project, so it has nowhere to be recorded;
+      * a MODIFY changes a plan without changing the engine's recommendation,
+        and the officer's wording must be kept verbatim;
+      * a status progression is a decision an auditor needs to see.
+
+    `recommendations` rows are engine output and are refreshed in place by
+    `recommendations.generate_all`, so an officer's decision cannot live there.
+    Every field on this table is therefore the officer's, written once and never
+    rewritten by the engine.
+
+    No credential of any kind is stored: the officer is identified by
+    `officer_id`, a foreign key to the `users` mirror row, never by a token,
+    password or auth-module id.
+    """
+    __tablename__ = "officer_decisions"
+
+    id = Column(Integer, primary_key=True)
+    # Nullable so a decision that outlives its recommendation is still kept.
+    # Deleting a recommendation is prevented rather than relied upon.
+    recommendation_id = Column(Integer, ForeignKey("recommendations.id"), nullable=True)
+    # Set when the decision produced or changed a project; NULL for a rejection.
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=True)
+    officer_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    # Approved | Modified | Rejected | Status Changed
+    decision = Column(String(30))
+    # The officer's own words. Required for a rejection, optional otherwise.
+    reason = Column(Text, nullable=True)
+    # The plan as it stood at decision time, so a later edit is still auditable.
+    action_snapshot = Column(String(300), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    project = relationship("Project", back_populates="decisions")
+    recommendation = relationship("Recommendation")
+    officer = relationship("User")
 
 
 class Recommendation(Base):
@@ -186,3 +258,47 @@ class ImpactMetric(Base):
     metric_name = Column(String(120))
     value = Column(Float)
     recorded_at = Column(DateTime, default=datetime.utcnow)
+
+
+class ProjectImpact(Base):
+    """
+    Impact measurement for a completed project.
+
+    A project progresses: Approved -> In Progress -> Completed -> Impact recorded.
+    Only a Completed project may have an impact record. An officer records observed
+    measurements (not causal claims) after the work is finished.
+
+    Calculated fields (before/after complaint counts, severity averages) are
+    derived from actual complaint data where the time boundary permits. Where it
+    does not, the officer provides a manual measurement with notes.
+    """
+    __tablename__ = "project_impacts"
+
+    id = Column(Integer, primary_key=True)
+    project_id = Column(Integer, ForeignKey("projects.id"), unique=True, nullable=False)
+
+    # Complaint-based measurements (calculated where possible)
+    before_complaint_count = Column(Integer, nullable=True)
+    after_complaint_count = Column(Integer, nullable=True)
+    complaints_resolved = Column(Integer, nullable=True)
+
+    # Severity/demand measurements (calculated or manual)
+    before_avg_severity_score = Column(Float, nullable=True)
+    after_avg_severity_score = Column(Float, nullable=True)
+    before_avg_priority_score = Column(Float, nullable=True)
+    after_avg_priority_score = Column(Float, nullable=True)
+
+    # Measurement metadata
+    measurement_period_start = Column(DateTime, nullable=True)
+    measurement_period_end = Column(DateTime, nullable=True)
+
+    # Officer input
+    officer_notes = Column(Text, nullable=True)
+    recorded_by_officer_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    # Relationships
+    project = relationship("Project", back_populates="impact")
+    recorded_by = relationship("User")

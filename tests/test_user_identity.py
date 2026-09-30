@@ -1,14 +1,19 @@
 """
-Regression tests for the auth-mirror identity fix.
+Regression tests for the auth identity fix.
 
-`backend/auth.py` keeps users in a process-local dict and hands out integer
-ids from a counter that restarts at 1. Before this fix the `users` mirror row
-was keyed on that integer, so after a restart a different account could be
-given an id an earlier account already held, overwrite its row, and read its
-complaints through `/complaints/my`.
+These were originally written when `backend/auth.py` kept users in a
+process-local dict and handed out integer ids from a counter that restarted at
+1. A restart therefore deleted every account and reissued ids, and the `users`
+mirror row was keyed on that integer -- so a different account could be given an
+id an earlier one already held, overwrite its row, and read its complaints
+through `/complaints/my`.
 
-The mirror is now keyed on `users.auth_key`, a stable per-account identity, and
-the primary key is issued by the database.
+Accounts are now rows in `users` and ids are database sequences, so a restart
+destroys nothing. The property these tests protect is unchanged and still the
+point of the whole design: **one account must never inherit another's
+complaints**, and ownership must never hang off anything a process can reuse.
+`auth_key` -- derived from the email, the one identifier that survives a restart
+-- remains the ownership key.
 """
 import pytest
 from fastapi.testclient import TestClient
@@ -29,7 +34,7 @@ ANALYSIS = {
 
 
 class AuthUser:
-    """Stand-in for backend.auth's in-memory UserInDB."""
+    """Stand-in for the authenticated-user object handed to the complaint layer."""
 
     def __init__(self, uid, name, email, role="citizen"):
         from datetime import datetime
@@ -42,12 +47,19 @@ class AuthUser:
 
 def _simulate_auth_restart(monkeypatch) -> None:
     """
-    Reproduce exactly what a process restart does to the auth module: the user
-    dict is empty and the id counter is back at 0, so the next account
-    registered is handed id 1 again.
+    Model a process restart.
+
+    It used to mean "empty the user dict and reset the id counter", which
+    deleted every account. Accounts are rows now, so a restart cannot be
+    simulated by clearing memory -- the closest faithful equivalent is to
+    re-import the module, giving a fresh interpreter state, and let the tests
+    prove the rows in the database are what carry identity.
     """
-    monkeypatch.setattr(auth_module, "MOCK_USERS_DB", {})
-    monkeypatch.setattr(auth_module, "USER_ID_COUNTER", 0)
+    import importlib
+
+    monkeypatch.setattr(auth_module, "MOCK_USERS_DB", {}, raising=False)
+    monkeypatch.setattr(auth_module, "USER_ID_COUNTER", 0, raising=False)
+    importlib.reload(auth_module)
 
 
 def _complaint(text):
@@ -65,7 +77,15 @@ def test_auth_key_is_derived_from_the_surviving_identifier():
 
 
 def test_reused_auth_id_does_not_overwrite_or_inherit(clean_db, monkeypatch):
-    """The full Alice -> restart -> Bob story, in the order it actually happens."""
+    """
+    The full Alice -> restart -> Bob story, in the order it happens.
+
+    Two accounts are given the *same* auth integer -- the condition that used to
+    destroy ownership -- and the rest of the test proves Bob still cannot reach
+    Alice's complaint. Ids now come from a database sequence, so this scenario
+    cannot arise on its own; it is forced here because the ownership key must
+    still be `auth_key` rather than anything a process can reissue.
+    """
     # --- 1. Alice files a complaint ---
     alice = AuthUser(1, "Alice Original", "alice@example.com")
     stored = svc.persist_complaint(
@@ -78,7 +98,6 @@ def test_reused_auth_id_does_not_overwrite_or_inherit(clean_db, monkeypatch):
 
     # --- 2/3. the process restarts, so Bob is handed auth id 1 as well ---
     _simulate_auth_restart(monkeypatch)
-    assert auth_module.USER_ID_COUNTER == 0
     bob = AuthUser(1, "Bob Newcomer", "bob@example.com")
     assert bob.id == alice.id, "the point of the test is that this id repeats"
 
@@ -188,12 +207,21 @@ def _register(client, email, name, role="citizen"):
 
 
 def test_api_ownership_survives_an_auth_restart(client, clean_db, monkeypatch):
+    """
+    Ownership must not depend on anything a process can lose.
+
+    When users lived in a dict, a restart logged everyone out and re-registering
+    was the only way back. Accounts are rows now, so Alice's *original token*
+    keeps working straight through a restart, and her address is reported as
+    already registered rather than silently accepted as a second account.
+    """
     alice = _register(client, "restart-alice@example.com", "Alice Original")
     client.post("/complaints", headers=alice, json={
         "text": "Alice private complaint about the potholes",
         "language": "English", "location": "Kothrud"})
 
     _simulate_auth_restart(monkeypatch)
+
     bob = _register(client, "restart-bob@example.com", "Bob Newcomer")
     client.post("/complaints", headers=bob, json={
         "text": "Bob entirely different garbage problem",
@@ -204,13 +232,19 @@ def test_api_ownership_survives_an_auth_restart(client, clean_db, monkeypatch):
     assert all("Alice" not in c["text"] for c in bob_mine.json()["complaints"])
     assert len(bob_mine.json()["complaints"]) == 1
 
-    # The pre-restart token no longer resolves to a live account, so Alice's
-    # own view is re-established by logging back in as her.
-    alice_again = _register(client, "restart-alice@example.com", "Alice Original")
-    alice_mine = client.get("/complaints/my", headers=alice_again)
-    assert alice_mine.status_code == 200
-    assert len(alice_mine.json()["complaints"]) == 1
-    assert "Alice" in alice_mine.json()["complaints"][0]["text"]
+    # The token minted before the restart still resolves, because the account
+    # is still there. This is the property the in-memory store could not offer.
+    alice_still_valid = client.get("/complaints/my", headers=alice)
+    assert alice_still_valid.status_code == 200
+    assert len(alice_still_valid.json()["complaints"]) == 1
+    assert "Alice" in alice_still_valid.json()["complaints"][0]["text"]
+
+    # And the account cannot be silently duplicated by registering again.
+    again = client.post("/auth/register", json={
+        "full_name": "Alice Impostor", "email": "restart-alice@example.com",
+        "password": "password123"})
+    assert again.status_code == 400
+    assert "already registered" in again.json()["detail"].lower()
 
     rows = clean_db.query(models.User).all()
     assert {r.name for r in rows} == {"Alice Original", "Bob Newcomer"}

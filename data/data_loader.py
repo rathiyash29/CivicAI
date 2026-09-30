@@ -28,6 +28,7 @@ Usage:
 """
 import argparse
 import logging
+import re
 
 import pandas as pd
 from sqlalchemy.orm import Session
@@ -51,6 +52,125 @@ CATEGORIES = [
     "Road Infrastructure", "Water Supply", "Electricity",
     "Sanitation", "Healthcare", "Education",
 ]
+
+# Approximate administrative centre of each ward, plus the locality the ward
+# administers. These are static constants on purpose:
+#
+#   * no geocoding API is called, so nothing here costs money, needs a key, or
+#     changes between runs -- a demo that re-centres its own wards is impossible
+#     to test;
+#   * a ward centroid is a *label position* for an aggregate, not a claim that a
+#     complaint happened at that exact point. The dashboard says as much.
+#
+# Every value is a rounded ward-level centre, accurate to roughly a kilometre.
+# `load_coordinates` writes them into the existing nullable `latitude`,
+# `longitude` and `area` columns; no schema change is involved.
+#
+#   ward            latitude  longitude  area
+WARD_CENTROIDS: dict[str, tuple[float, float, str]] = {
+    "Kothrud":      (18.5074, 73.8077, "Kothrud"),
+    "Hadapsar":     (18.5089, 73.9260, "Hadapsar"),
+    "Wanowrie":     (18.5087, 73.8620, "Wanowrie"),
+    "Aundh":        (18.5590, 73.8080, "Aundh"),
+    "Baner":        (18.5642, 73.7769, "Baner"),
+    "Shivajinagar": (18.5308, 73.8470, "Shivajinagar"),
+    "Kondhwa":      (18.4649, 73.8927, "Kondhwa"),
+    "Katraj":       (18.4483, 73.8677, "Katraj"),
+    "Yerawada":     (18.5515, 73.8795, "Yerawada"),
+    "Viman Nagar":  (18.5679, 73.9143, "Viman Nagar"),
+}
+
+# Curated locality -> ward aliases, the same way a municipal gazetteer would.
+#
+# WHY THIS EXISTS
+# ---------------
+# Citizens type the neighbourhood they live in ("sukhsagarnagar,Pune"), not the
+# administrative ward name. `backend/locations.py` can only resolve text that
+# matches a `Location` row, and the ward names alone are not enough, so those
+# complaints stayed `location_id = NULL` and landed in the "Unassigned" bucket --
+# invisible on the map and excluded from every per-ward aggregate.
+#
+# WHY IT IS A CONSTANT, NOT A GUESS
+# ---------------------------------
+# This is an explicit, reviewable, version-controlled list. Each entry is a
+# locality a human has placed inside a ward; it is never inferred at runtime,
+# never fuzzy-matched, and never extended from a free-text string. A locality
+# that is not listed here stays unresolved, which is the correct outcome -- an
+# honest "unresolved" beats a confidently wrong ward, because a wrong ward
+# silently corrupts every downstream aggregate (population normalisation,
+# infrastructure gap, hotspot scores).
+#
+# Adding an entry is therefore a deliberate editorial act, reviewed in a diff
+# like any other code change. Adding a locality this table does not name would
+# mean inventing civic geography, so it is deliberately not possible.
+#
+# Only the ward's own localities belong here. A locality that straddles two
+# wards must be left out entirely rather than guessed into one of them.
+#
+# Two constraints keep this table from poisoning the resolver:
+#
+#   * entries are LOCALITY NAMES ONLY. Never write a city, a district or a
+#     "Locality, Pune" form here. The `area` column is comma-separated and the
+#     resolver splits on commas, so an entry containing a city name would
+#     become a bare alias for that city -- and "Pune" would then resolve to a
+#     ward, which is exactly the kind of confidently wrong answer this whole
+#     mechanism exists to prevent. A citizen typing "Bibvewadi, Pune" already
+#     matches the "Bibvewadi" alias on its own, because whole-word matching
+#     tolerates the extra city token.
+#   * an entry may not equal a ward name. `validate_localities` refuses both
+#     cases loudly rather than letting them reach the database.
+#
+#   ward          localities administered by that ward
+WARD_LOCALITIES: dict[str, list[str]] = {
+    "Kothrud": [
+        "Sukhsagar Nagar",
+        "Sukhsagarnagar",
+    ],
+    "Hadapsar": [
+        "Bibvewadi",
+    ],
+}
+
+# City, district and state names. A locality equal to one of these is a data
+# error, not a location: see the constraints above.
+NON_LOCALITY_NAMES = {
+    "pune", "pimpri", "chinchwad", "pcmc", "maharashtra", "india",
+}
+
+
+def validate_localities() -> None:
+    """
+    Fail loudly on a locality entry that would resolve the wrong thing.
+
+    Raises `ValueError` rather than silently skipping, because an entry like a
+    bare city name is a data bug in *this file*, and quietly dropping it would
+    leave a half-configured mapping that looks intentional.
+    """
+    ward_names = {w.lower() for w in PUNE_WARDS}
+    problems: list[str] = []
+
+    for ward, localities in WARD_LOCALITIES.items():
+        if ward not in PUNE_WARDS:
+            problems.append(f"{ward!r} has localities but is not in PUNE_WARDS")
+        for locality in localities:
+            key = re.sub(r"\s+", " ", locality.strip().lower())
+            if not key:
+                problems.append(f"{ward!r} has an empty locality")
+            elif key in NON_LOCALITY_NAMES:
+                problems.append(
+                    f"{ward!r} lists the city/district name {locality!r}; "
+                    "localities must be locality names only"
+                )
+            elif key in ward_names:
+                problems.append(
+                    f"{ward!r} lists {locality!r}, which is already a ward name"
+                )
+
+    if problems:
+        raise ValueError(
+            "WARD_LOCALITIES is invalid:\n  " + "\n  ".join(problems)
+        )
+
 
 # Plausible land area in km^2 per ward, so population density is derived from
 # something real rather than dividing by a random number.
@@ -256,11 +376,70 @@ def load_investments(db: Session) -> int:
     return processed
 
 
+def ward_area_label(ward: str) -> str:
+    """
+    The value written to `Location.area` for a ward: the ward's own name
+    followed by any curated localities it administers, comma separated.
+
+    The ward name stays in the list so the column still reads sensibly on its
+    own, and so a `None` area remains impossible for a configured ward. The
+    resolver (`backend/locations.resolve_location`) splits this on commas and
+    matches each part independently, which is what lets a citizen who typed a
+    neighbourhood name instead of the ward name be resolved correctly.
+
+    Only names from `WARD_LOCALITIES` ever appear here. Nothing is derived from
+    complaint text, so this function cannot invent a location.
+    """
+    parts = [ward, *WARD_LOCALITIES.get(ward, [])]
+    return ", ".join(parts)
+
+
+def load_coordinates(db: Session) -> int:
+    """
+    Fill in the existing nullable `latitude` / `longitude` / `area` columns.
+
+    Idempotent by construction: it matches on the same (ward, city) key every
+    other loader uses and only writes when the stored value differs, so running
+    it twice leaves the table byte-identical. A ward missing from
+    `WARD_CENTROIDS` is skipped and counted as unprocessed rather than being
+    given a made-up point.
+
+    This is what makes the dashboard map possible: `db_hotspots` already
+    passes `latitude`, `longitude` and `area` straight through from this table,
+    so filling it in here needs no API change at all.
+    """
+    validate_localities()
+
+    processed = 0
+    for ward, (latitude, longitude, _centroid_label) in WARD_CENTROIDS.items():
+        if ward not in PUNE_WARDS:
+            # The centroid table and the ward list are meant to agree. A stray
+            # entry is a bug in this file, not a reason to invent a location.
+            log.warning("Ward %r has a centroid but is not in PUNE_WARDS; skipped", ward)
+            continue
+
+        area = ward_area_label(ward)
+        loc = get_or_create_location(db, ward)
+        if (
+            loc.latitude != latitude
+            or loc.longitude != longitude
+            or loc.area != area
+        ):
+            loc.latitude = latitude
+            loc.longitude = longitude
+            loc.area = area
+        processed += 1
+
+    log.info("Set ward centroids for %d wards", processed)
+    return processed
+
+
 def load_all() -> dict:
     """Create the schema if needed and (re)load every dataset. Idempotent."""
     init_db()
     with session_scope() as db:
         counts = {
+            "coordinates": load_coordinates(db),
             "demographics": load_demographics(db),
             "infrastructure": load_infrastructure(db),
             "investments": load_investments(db),

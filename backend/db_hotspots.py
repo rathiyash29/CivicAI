@@ -39,6 +39,12 @@ BANDS = (("Low", 29.0), ("Medium", 59.0), ("High", 100.0))
 
 DEFAULT_MIN_COMPLAINTS = 3
 
+# The ward bucket used when a complaint has no resolvable location. This is the
+# same literal `db_duplicates.assign_cluster` uses when it keys a cluster, and
+# the two must stay identical or the cluster join below silently returns
+# nothing.
+UNASSIGNED_WARD = "Unassigned"
+
 
 def _level_for(score: float) -> str:
     for label, ceiling in BANDS:
@@ -64,7 +70,43 @@ def _ward_for(db: Session, complaint: models.Complaint) -> str:
         location = db.query(models.Location).filter_by(id=complaint.location_id).first()
         if location and location.ward:
             return location.ward
-    return "Unassigned"
+    return UNASSIGNED_WARD
+
+
+def _clusters_for_scope(db: Session, ward: str, category: str) -> list[int]:
+    """
+    Ids of every cluster in exactly this (ward, category) scope.
+
+    This is the one join that is safe between clusters and hotspots, because
+    both are keyed on the same pair, derived the same way: `assign_cluster`
+    uses `Location.ward or "Unassigned"` and `category or "Other"`, and the
+    grouping below uses the identical expressions. So the cluster set for a
+    hotspot is fully determined by the data.
+
+    It is deliberately a LIST, never a single id. One (ward, category) scope can
+    hold several clusters -- that is exactly what `assign_cluster` creates when
+    the complaint texts in one ward differ -- and picking one of them would be a
+    guess presented to an officer as fact.
+    """
+    return [
+        cluster.id
+        for cluster in db.query(models.IssueCluster)
+        .filter_by(ward=ward, category=category)
+        .order_by(models.IssueCluster.id)
+        .all()
+    ]
+
+
+def _location_for_ward(db: Session, ward: str) -> Optional[models.Location]:
+    """The `Location` row for a ward, or None when the ward is unknown.
+
+    Coordinates are returned exactly as stored. Every column here is nullable
+    and, in the current dataset, empty -- a hotspot with no known position
+    reports `None` rather than a fabricated point.
+    """
+    if ward == UNASSIGNED_WARD:
+        return None
+    return db.query(models.Location).filter_by(ward=ward).first()
 
 
 def compute_hotspots(
@@ -77,6 +119,11 @@ def compute_hotspots(
 
     `min_complaints` keeps a single stray report from lighting up a map;
     `limit` trims the list for dashboard display.
+
+    Each hotspot also carries the ids of the clusters inside its scope, so a
+    consumer can follow a hotspot through to its clusters and on to the
+    recommendations that hang off them. See `_clusters_for_scope` for why that
+    is a list.
     """
     groups: dict[tuple[str, str], dict] = {}
 
@@ -105,6 +152,7 @@ def compute_hotspots(
         medium = bucket["medium_severity_count"]
         score = hotspot_score(count, high, medium)
 
+        location = _location_for_ward(db, ward)
         hotspots.append({
             "location": ward,
             "category": category,
@@ -113,6 +161,14 @@ def compute_hotspots(
             "medium_severity_count": medium,
             "hotspot_score": score,
             "hotspot_level": _level_for(score),
+            # Additive. Deterministic scope join -- see `_clusters_for_scope`.
+            "cluster_ids": _clusters_for_scope(db, ward, category),
+            # Additive, and nullable by design. The columns already exist on
+            # `locations`; these are passed through untouched, so a ward with no
+            # recorded position reports None instead of an invented one.
+            "area": location.area if location else None,
+            "latitude": location.latitude if location else None,
+            "longitude": location.longitude if location else None,
         })
 
     # Ties broken by volume so the ordering is stable and meaningful.

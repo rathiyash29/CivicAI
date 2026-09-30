@@ -172,6 +172,60 @@ def _refresh_cluster_stats(db: Session, cluster: models.IssueCluster) -> None:
     cluster.avg_severity_score = _severity_score(members)
 
 
+def reconcile_cluster_stats(
+    db: Session,
+    commit: bool = True,
+) -> list[dict]:
+    """
+    Recompute every cluster's stored statistics from its actual members.
+
+    `IssueCluster.complaint_count` and `avg_severity_score` are a denormalised
+    cache of the complaints pointing at the cluster. `_refresh_cluster_stats`
+    keeps it correct while complaints are assigned, but nothing reconciles it
+    when membership changes by another route -- a bulk re-cluster, a data reload
+    that repoints `cluster_id`, or a row inserted outside the request path. A
+    cluster whose members have all moved away then keeps claiming complaints it
+    no longer has, and that stale number is read back by the priority engine.
+
+    This walks every cluster in id order -- deterministic, and a no-op for
+    clusters that are already correct -- and re-derives both fields from the
+    members actually assigned. A cluster with no members ends at 0 complaints
+    and 0.0 average severity rather than keeping its last known figures.
+
+    Nothing is deleted: an orphaned cluster is a real historical group that
+    simply has no members right now, and its identity is still referenced by
+    the recommendations table.
+    """
+    before: dict[int, tuple] = {}
+    clusters = db.query(models.IssueCluster).order_by(models.IssueCluster.id).all()
+    for cluster in clusters:
+        before[cluster.id] = (cluster.complaint_count, cluster.avg_severity_score)
+
+    for cluster in clusters:
+        _refresh_cluster_stats(db, cluster)
+
+    results = []
+    for cluster in clusters:
+        old_count, old_severity = before[cluster.id]
+        results.append({
+            "cluster_id": cluster.id,
+            "ward": cluster.ward,
+            "category": cluster.category,
+            "members_before": old_count,
+            "members_after": cluster.complaint_count,
+            "avg_severity_before": old_severity,
+            "avg_severity_after": cluster.avg_severity_score,
+            "changed": (old_count != cluster.complaint_count
+                        or old_severity != cluster.avg_severity_score),
+        })
+
+    if commit:
+        db.commit()
+    else:
+        db.flush()
+    return results
+
+
 def cluster_all_unclustered(
     db: Session,
     threshold: float = SIMILARITY_THRESHOLD,
@@ -231,7 +285,16 @@ def assign_cluster(
             .first()
         )
         if existing is not None:
+            # Already clustered, so the assignment itself is a no-op -- but the
+            # cluster's cached statistics may still be out of date, and this is
+            # the one code path that is guaranteed to be looking at it.
+            _refresh_cluster_stats(db, existing)
             return existing, False
+
+    # Note: reassignment that happens *outside* this function (a bulk re-cluster
+    # or a data reload repointing `cluster_id`) leaves the cluster the complaint
+    # left still counting it. That path has no way to know the previous owner
+    # from here, which is why `reconcile_cluster_stats` exists.
 
     ward = _ward(db, complaint) or "Unassigned"
     category = complaint.category or "Other"

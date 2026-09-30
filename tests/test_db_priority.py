@@ -138,6 +138,9 @@ def test_cluster_size_drives_demand_when_clustered(clean_db, make_location):
                                   complaint_count=25)
     clean_db.add(cluster)
     clean_db.commit()
+    for _ in range(25):
+        clean_db.add(models.Complaint(text="no water", category="Water Supply",
+                                      location_id=loc.id, cluster_id=cluster.id))
     c = models.Complaint(text="no water", category="Water Supply",
                          location_id=loc.id, cluster_id=cluster.id)
     clean_db.add(c)
@@ -145,9 +148,43 @@ def test_cluster_size_drives_demand_when_clustered(clean_db, make_location):
 
     count, basis = db_priority.get_demand_group_count(clean_db, c)
     assert basis == "cluster"
-    assert count == 25
-    # 25 complaints on the saturating curve (half point 5) -> 83.3
-    assert db_priority.get_citizen_demand(clean_db, c) == 83.3
+    assert count == 26
+    # 26 complaints on the saturating curve (half point 5) -> 83.9
+    assert db_priority.get_citizen_demand(clean_db, c) == 83.9
+
+
+def test_stale_cluster_count_does_not_inflate_demand(clean_db, make_location):
+    """
+    `IssueCluster.complaint_count` is a cache. A cluster that claims 25 members
+    while holding one must not hand that inflated number to the priority score.
+    """
+    loc = make_location("Kothrud")
+    cluster = models.IssueCluster(label="c", category="Water Supply", ward="Kothrud",
+                                  complaint_count=25)
+    clean_db.add(cluster)
+    clean_db.commit()
+    c = models.Complaint(text="no water", category="Water Supply",
+                         location_id=loc.id, cluster_id=cluster.id)
+    clean_db.add(c)
+    clean_db.commit()
+
+    count, basis = db_priority.get_demand_group_count(clean_db, c)
+    assert (count, basis) == (1, "cluster"), "the stored 25 must be ignored"
+    # One complaint on the saturating curve (half point 5) -> 16.7
+    assert db_priority.get_citizen_demand(clean_db, c) == 16.7
+
+
+def test_unclustered_complaint_uses_location_and_category(clean_db, make_location):
+    """Without a cluster the demand group is the ward + category it falls in."""
+    loc = make_location("Kothrud")
+    for index in range(3):
+        clean_db.add(models.Complaint(text=f"no water {index}", category="Water Supply",
+                                      location_id=loc.id))
+    clean_db.commit()
+
+    c = clean_db.query(models.Complaint).first()
+    count, basis = db_priority.get_demand_group_count(clean_db, c)
+    assert (count, basis) == (3, "location_category")
 
 
 # --- factors sourced from the database -------------------------------------

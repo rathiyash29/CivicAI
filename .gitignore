@@ -32,5 +32,16 @@ Thumbs.db
 .pytest_cache/
 .mypy_cache/
 
+# Local database files
+# Never commit a database: it holds seeded/demo data and, once the service is
+# live, real citizen reports. DATABASE_URL (PostgreSQL) is what production uses.
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+data/*.db
+data/*.sqlite
+data/*.sqlite3
+
 # Logs
 *.log

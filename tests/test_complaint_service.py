@@ -11,10 +11,13 @@ from backend import complaint_service as svc
 from backend import db_duplicates, db_priority
 from database import models
 
-# The exact contract the React frontend depends on (api/complaints.ts).
+# The exact contract the React frontend depends on (api/complaints.ts). The
+# `analysis_*` and `cluster_id` fields are additive, for the officer dashboard.
 FRONTEND_COMPLAINT_FIELDS = {
     "complaint_id", "user_id", "text", "language", "location", "category",
     "severity", "priority_score", "priority_level", "status", "created_at",
+    "cluster_id", "analysis_urgency", "analysis_affected_group",
+    "analysis_issue_summary", "analysis_recommended_action",
 }
 
 
@@ -339,11 +342,28 @@ def test_complaint_user_id_is_null_when_the_user_cannot_be_mirrored(clean_db, st
     assert clean_db.query(models.User).count() == 0
 
 
-def test_no_password_is_stored_in_the_mirror(clean_db, store):
-    """auth is not being migrated yet; no password material in the DB."""
+def test_the_mirror_stores_a_bcrypt_hash_never_a_plaintext_password(clean_db, store):
+    """
+    This used to assert the users table had *no* password column at all, which
+    was true only while auth was a process-local dict. Auth is database-backed
+    now, so the column exists -- and the property that actually matters is
+    stronger: what lands in it is a one-way bcrypt digest.
+
+    Mirroring a user (which happens on every complaint submission) must not
+    disturb or duplicate the credential the auth service already wrote.
+    """
     store()
     columns = {c.name for c in models.User.__table__.columns}
-    assert "password_hash" not in columns
+    assert "password_hash" in columns
+
+    row = clean_db.query(models.User).one()
+    # The complaint-mirroring path creates the row for an account that may not
+    # have been created through /auth/register. Either way, whatever is here
+    # must not be a plaintext password.
+    if row.password_hash is not None:
+        assert row.password_hash.startswith("$2"), "passwords must be bcrypt hashed"
+        assert "password123" not in row.password_hash
+    assert not hasattr(row, "password")
 
 
 def test_anonymous_submission_mirrors_nothing(clean_db, store):

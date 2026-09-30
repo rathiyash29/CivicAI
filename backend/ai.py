@@ -12,6 +12,45 @@ AI_PROVIDER = os.getenv("AI_PROVIDER", "mock")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3-flash-preview")
 
+# Which provider actually produced an analysis. `AI_PROVIDER` is only the
+# *requested* provider: when Gemini fails and the mock takes over, the honest
+# answer is "mock", and these two values are not the same thing.
+PROVIDER_GEMINI = "gemini"
+PROVIDER_MOCK = "mock"
+
+# Machine-readable reasons a fallback happened. These are deliberately coarse
+# and deliberately safe to return over HTTP: a client needs to know whether it
+# got real AI, not why the vendor rejected the call. No exception text, no
+# vendor error body, and never a credential ever reaches a response.
+FALLBACK_QUOTA_EXHAUSTED = "quota_exhausted"
+FALLBACK_API_ERROR = "api_error"
+FALLBACK_INVALID_RESPONSE = "invalid_response"
+FALLBACK_NOT_CONFIGURED = "not_configured"
+FALLBACK_UNEXPECTED = "unexpected_error"
+
+# Vendor error text is matched case-insensitively to pick a reason. Kept here
+# as substrings rather than a regex so a vendor reworded message degrades to
+# FALLBACK_API_ERROR instead of crashing the classifier.
+_QUOTA_MARKERS = ("429", "quota", "resource_exhausted", "rate limit", "rate_limit")
+_UNAUTHORIZED_MARKERS = ("401", "403", "unauthorized", "permission", "api key",
+                         "forbidden")
+_BAD_REQUEST_MARKERS = ("400", "invalid argument", "invalid_request")
+
+
+class GeminiError(RuntimeError):
+    """
+    A Gemini failure, carrying a safe reason code.
+
+    The original vendor message is deliberately NOT retained on the exception
+    object beyond what the constructor was given, because these exceptions
+    propagate toward an HTTP response. Callers get `reason`; nobody gets the
+    raw vendor text.
+    """
+
+    def __init__(self, reason: str, user_message: str):
+        super().__init__(user_message)
+        self.reason = reason
+
 CATEGORIES = [
     "Road Infrastructure",
     "Water Supply",
@@ -101,21 +140,85 @@ URGENCY_KEYWORDS = {
 def analyze_complaint(text: str, language: str, location: str) -> dict:
     """
     Analyze a citizen complaint using the configured AI provider.
-    Returns structured analysis compatible with existing API endpoints.
+
+    The returned dict is the existing analysis contract, unchanged, plus two
+    additive keys:
+
+      provider_used     "gemini" or "mock" -- what ACTUALLY produced this
+                        analysis. Never the configured value, which is only
+                        what was asked for.
+      fallback_reason   OMITTED from the analysis dict when there was no
+                        fallback, and set to one of quota_exhausted |
+                        api_error | invalid_response | not_configured |
+                        unexpected_error when there was. (The HTTP envelope in
+                        `main.py` always carries the key, null when unused, so
+                        the response schema stays stable.)
+
+    Reporting the provider that ran is the whole point. A demo that silently
+    substitutes keyword matching while claiming real AI is worse than one that
+    openly says it fell back.
     """
-    if AI_PROVIDER == "gemini":
+    if AI_PROVIDER == PROVIDER_GEMINI:
         try:
-            return analyze_with_gemini(text, language, location)
-        except ValueError as e:
-            logger.warning(f"Gemini config error, falling back to mock: {e}")
-            return analyze_with_mock(text, language, location)
-        except RuntimeError as e:
-            logger.warning(f"Gemini API error, falling back to mock: {e}")
-            return analyze_with_mock(text, language, location)
-        except Exception as e:
-            logger.warning(f"Unexpected Gemini error, falling back to mock: {e}")
-            return analyze_with_mock(text, language, location)
-    return analyze_with_mock(text, language, location)
+            result = analyze_with_gemini(text, language, location)
+        except GeminiError as exc:
+            logger.warning(
+                "Gemini unavailable (%s); falling back to mock analysis", exc.reason
+            )
+            result = _with_provider(analyze_with_mock(text, language, location),
+                                    PROVIDER_MOCK, exc.reason)
+        except ValueError as exc:
+            # Kept for safety: any future non-GeminiError ValueError raised
+            # inside the Gemini path still degrades instead of 500-ing.
+            logger.warning("Gemini config error; falling back to mock: %s", exc)
+            result = _with_provider(analyze_with_mock(text, language, location),
+                                    PROVIDER_MOCK, FALLBACK_NOT_CONFIGURED)
+        except Exception:
+            # The vendor message is logged at debug level only. It is not put
+            # in the response, because an unexpected exception is exactly the
+            # case most likely to carry a credential or an internal URL.
+            logger.warning("Unexpected Gemini error; falling back to mock",
+                           exc_info=True)
+            result = _with_provider(analyze_with_mock(text, language, location),
+                                    PROVIDER_MOCK, FALLBACK_UNEXPECTED)
+        else:
+            result = _with_provider(result, PROVIDER_GEMINI)
+        return result
+
+    return _with_provider(analyze_with_mock(text, language, location), PROVIDER_MOCK)
+
+
+def _with_provider(analysis: dict, provider_used: str,
+                   fallback_reason: str = None) -> dict:
+    """
+    Stamp the provenance of an analysis onto it.
+
+    `fallback_reason` is omitted entirely when there was no fallback, rather
+    than sent as null, so a client can branch on key presence and a successful
+    Gemini call cannot be mistaken for a degraded one.
+    """
+    analysis["provider_used"] = provider_used
+    if fallback_reason:
+        analysis["fallback_reason"] = fallback_reason
+    return analysis
+
+
+def _classify_gemini_error(message: str) -> str:
+    """
+    Map a vendor error message onto a safe, coarse reason code.
+
+    Quota is checked first and separately from the other codes, because the
+    free tier's 429 is a *daily* allowance rather than a burst limit: retrying
+    cannot help, so the caller must not try.
+    """
+    lowered = (message or "").lower()
+    if any(marker in lowered for marker in _QUOTA_MARKERS):
+        return FALLBACK_QUOTA_EXHAUSTED
+    if any(marker in lowered for marker in _UNAUTHORIZED_MARKERS):
+        return FALLBACK_API_ERROR
+    if any(marker in lowered for marker in _BAD_REQUEST_MARKERS):
+        return FALLBACK_API_ERROR
+    return FALLBACK_API_ERROR
 
 
 def analyze_with_mock(text: str, language: str, location: str) -> dict:
@@ -148,24 +251,35 @@ def analyze_with_mock(text: str, language: str, location: str) -> dict:
 def analyze_with_gemini(text: str, language: str, location: str) -> dict:
     """
     Analyze a citizen complaint using Google Gemini AI.
-    Returns structured analysis compatible with existing API endpoints.
-    
+
+    Returns the plain analysis contract. Provenance is added by the caller
+    (`analyze_complaint`), so this function stays directly testable against a
+    stubbed client and a bare call to it never reports a provider.
+
     Raises:
-        ValueError: If GEMINI_API_KEY is not configured.
-        RuntimeError: If Gemini API call fails (network, permission, invalid response).
-        json.JSONDecodeError: If Gemini response is not valid JSON.
+        GeminiError: always. Carries a safe `reason` code from the
+            FALLBACK_* constants, and a user-facing message that contains no
+            vendor text and no credential.
+
+    No retry is attempted, and none should be added here without changing this
+    contract. The free tier's 429 is a daily per-project allowance, not a burst
+    limit, so an automatic retry is a guaranteed second failed call and would
+    burn the remaining quota rather than recover from it.
     """
     if not GEMINI_API_KEY:
-        raise ValueError(
-            "GEMINI_API_KEY environment variable is not set. "
-            "Set it in .env or export GEMINI_API_KEY to use the Gemini provider."
+        raise GeminiError(
+            FALLBACK_NOT_CONFIGURED,
+            "Gemini is not configured (no API key available).",
         )
 
     try:
         from google import genai
         from google.genai import types
     except ImportError as e:
-        raise RuntimeError(f"google-genai SDK not available: {e}")
+        raise GeminiError(
+            FALLBACK_API_ERROR,
+            f"google-genai SDK is not installed: {e}",
+        )
 
     client = genai.Client(api_key=GEMINI_API_KEY)
 
@@ -182,34 +296,44 @@ def analyze_with_gemini(text: str, language: str, location: str) -> dict:
             ),
         )
     except Exception as e:
-        error_msg = str(e).lower()
-        if "403" in error_msg or "permission" in error_msg:
-            raise RuntimeError(
-                "Gemini API access denied (403). "
-                "The Google AI project may not have access enabled. "
-                "Use AI_PROVIDER=mock for now."
-            )
-        if "401" in error_msg or "unauthorized" in error_msg or "api key" in error_msg:
-            raise RuntimeError(
-                "Gemini API key invalid or unauthorized (401). "
-                "Check GEMINI_API_KEY in .env."
-            )
-        if "429" in error_msg or "quota" in error_msg:
-            raise RuntimeError(
-                "Gemini API quota exceeded (429). "
-                "Try again later or use AI_PROVIDER=mock."
-            )
-        raise RuntimeError(f"Gemini API call failed: {e}")
+        # The vendor message drives the classification, but it never leaves
+        # this function: only the coarse reason code does.
+        reason = _classify_gemini_error(str(e))
+        logger.debug("Gemini call failed (%s): %s", reason, e)
+        raise GeminiError(
+            reason,
+            f"Gemini request failed ({reason}).",
+        ) from None
 
     if not response or not response.text:
-        raise RuntimeError("Gemini returned empty response")
+        raise GeminiError(
+            FALLBACK_INVALID_RESPONSE,
+            "Gemini returned an empty response.",
+        )
 
     try:
         result = json.loads(response.text)
-    except json.JSONDecodeError as e:
-        raise RuntimeError(f"Gemini returned invalid JSON: {e}. Raw: {response.text[:200]}")
+    except (json.JSONDecodeError, TypeError):
+        raise GeminiError(
+            FALLBACK_INVALID_RESPONSE,
+            "Gemini returned a response that was not valid JSON.",
+        ) from None
 
-    return _validate_and_normalize_gemini_result(result, language, location)
+    if not isinstance(result, dict):
+        raise GeminiError(
+            FALLBACK_INVALID_RESPONSE,
+            "Gemini returned valid JSON that was not an object.",
+        )
+
+    try:
+        return _validate_and_normalize_gemini_result(result, language, location)
+    except GeminiError:
+        raise
+    except Exception:
+        raise GeminiError(
+            FALLBACK_INVALID_RESPONSE,
+            "Gemini response did not match the CivicAI analysis schema.",
+        ) from None
 
 
 def _build_gemini_prompt(text: str, language: str, location: str) -> str:
@@ -243,7 +367,12 @@ Rules:
 
 
 def _validate_and_normalize_gemini_result(result: dict, language: str, location: str) -> dict:
-    """Validate and normalize Gemini response to match expected schema."""
+    """
+    Validate and normalize a Gemini response to the CivicAI analysis schema.
+
+    Raises `GeminiError(FALLBACK_INVALID_RESPONSE)` on a missing field, so a
+    schema miss degrades to the mock provider instead of surfacing as a 500.
+    """
     required_fields = [
         "language", "category", "location", "severity", "urgency",
         "affected_group", "issue_summary", "recommended_action"
@@ -251,7 +380,10 @@ def _validate_and_normalize_gemini_result(result: dict, language: str, location:
 
     for field in required_fields:
         if field not in result:
-            raise RuntimeError(f"Gemini response missing required field: {field}")
+            raise GeminiError(
+                FALLBACK_INVALID_RESPONSE,
+                f"Gemini response missing required field: {field}",
+            )
 
     # Normalize category to match known categories
     category = result["category"]

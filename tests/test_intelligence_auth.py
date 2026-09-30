@@ -18,6 +18,7 @@ from fastapi.testclient import TestClient
 
 from backend import router as M2
 from database import models
+from database.db import SessionLocal
 
 READ_ENDPOINTS = [
     ("GET", "/intelligence/stats"),
@@ -148,10 +149,32 @@ def test_role_matching_is_case_and_space_insensitive(client, make_auth_user, see
     assert client.get("/intelligence/stats", headers=headers).status_code == 200
 
 
-def test_missing_role_is_not_treated_as_officer(client, make_auth_user, seeded):
+def test_missing_role_is_not_treated_as_officer(client, make_auth_user, seeded, clean_db):
+    """
+    A blank role must fail closed, not open.
+
+    The role is read from the database on every request, so the row is the thing
+    to change here. Mutating the in-memory response object would prove nothing:
+    a client's idea of its own role is not what the guard consults, and a test
+    that relied on that was measuring the wrong property.
+    """
     from backend import auth as auth_module
-    user, token = make_auth_user("router-norole@example.com", role="officer")
-    user.role = ""
+    from database import models
+
+    make_auth_user("router-norole@example.com", role="officer")
+
+    row = clean_db.query(models.User).filter_by(email="router-norole@example.com").one()
+    row.role = ""
+    clean_db.commit()
+    clean_db.expire_all()
+
+    from backend.auth import create_access_token
+    token = create_access_token(data={"sub": "router-norole@example.com"})
     headers = {"Authorization": f"Bearer {token}"}
     assert client.get("/intelligence/stats", headers=headers).status_code == 403
-    assert auth_module.get_user_by_email("router-norole@example.com") is user
+
+    db = SessionLocal()
+    try:
+        assert auth_module.get_user_by_email(db, "router-norole@example.com") is not None
+    finally:
+        db.close()

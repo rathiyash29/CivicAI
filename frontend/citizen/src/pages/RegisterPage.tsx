@@ -1,6 +1,9 @@
 import { useState, useCallback } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
+import { normalizeErrorMessage } from '../api/client';
+import { PageShell } from '../components/PageShell';
+import { IconAlert } from '../components/Icons';
 import './AuthPage.css';
 
 export function RegisterPage() {
@@ -11,7 +14,6 @@ export function RegisterPage() {
     email: '',
     password: '',
     confirmPassword: '',
-    role: 'citizen' as 'citizen' | 'officer',
   });
   const [error, setError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
@@ -47,158 +49,129 @@ export function RegisterPage() {
         full_name: formData.full_name.trim(),
         email: formData.email.trim(),
         password: formData.password,
-        role: formData.role,
       });
       navigate('/complaint');
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Registration failed. Please try again.');
+      setError(
+        normalizeErrorMessage(err, 'Registration failed. Please try again.'),
+      );
     } finally {
       setIsLoading(false);
     }
   };
 
   return (
-    <div className="auth-page">
-      <header className="header">
-        <div className="container">
-          <div className="logo">CivicAI</div>
-          <nav className="nav">
-            <Link to="/" className="nav-link">Home</Link>
-          </nav>
-        </div>
-      </header>
+    <PageShell>
+      <section className="section">
+        <div className="container auth-page">
+          <div className="card card--pad-lg auth-card">
+            <header className="auth-card__header">
+              <span className="eyebrow">Citizen Portal</span>
+              <h1>Create your CivicAI account</h1>
+              <p className="page-head__lead">
+                An account lets you follow the status of every issue you report.
+              </p>
+            </header>
 
-      <main className="main">
-        <div className="container">
-          <div className="auth-container">
-            <div className="auth-card">
-              <div className="auth-header">
-                <h1>Create Account</h1>
-                <p>Join CivicAI to report community issues and make your voice heard</p>
+            {error && (
+              <div className="alert alert--error" role="alert">
+                <span className="alert__icon" aria-hidden="true"><IconAlert size={18} /></span>
+                <span>{error}</span>
               </div>
+            )}
 
-              {error && (
-                <div className="error-banner" role="alert">
-                  <span>{error}</span>
-                </div>
-              )}
-
-              <form onSubmit={handleSubmit} className="auth-form" noValidate>
-                <div className="form-group">
-                  <label htmlFor="full_name" className="label">
-                    Full Name <span className="required">*</span>
-                  </label>
-                  <input
-                    type="text"
-                    id="full_name"
-                    className="input"
-                    placeholder="Enter your full name"
-                    value={formData.full_name}
-                    onChange={(e) => handleChange('full_name', e.target.value)}
-                    required
-                    autoComplete="name"
-                    disabled={isLoading}
-                  />
-                </div>
-
-                <div className="form-group">
-                  <label htmlFor="email" className="label">
-                    Email <span className="required">*</span>
-                  </label>
-                  <input
-                    type="email"
-                    id="email"
-                    className="input"
-                    placeholder="Enter your email"
-                    value={formData.email}
-                    onChange={(e) => handleChange('email', e.target.value)}
-                    required
-                    autoComplete="email"
-                    disabled={isLoading}
-                  />
-                </div>
-
-                <div className="form-group">
-                  <label htmlFor="password" className="label">
-                    Password <span className="required">*</span>
-                  </label>
-                  <input
-                    type="password"
-                    id="password"
-                    className="input"
-                    placeholder="Create a password (min 8 characters)"
-                    value={formData.password}
-                    onChange={(e) => handleChange('password', e.target.value)}
-                    required
-                    autoComplete="new-password"
-                    disabled={isLoading}
-                  />
-                  <p className="helper-text">Minimum 8 characters</p>
-                </div>
-
-                <div className="form-group">
-                  <label htmlFor="confirmPassword" className="label">
-                    Confirm Password <span className="required">*</span>
-                  </label>
-                  <input
-                    type="password"
-                    id="confirmPassword"
-                    className="input"
-                    placeholder="Confirm your password"
-                    value={formData.confirmPassword}
-                    onChange={(e) => handleChange('confirmPassword', e.target.value)}
-                    required
-                    autoComplete="new-password"
-                    disabled={isLoading}
-                  />
-                </div>
-
-                <div className="form-group">
-                  <label htmlFor="role" className="label">
-                    Register As <span className="required">*</span>
-                  </label>
-                  <select
-                    id="role"
-                    className="select"
-                    value={formData.role}
-                    onChange={(e) => handleChange('role', e.target.value as 'citizen' | 'officer')}
-                    required
-                    disabled={isLoading}
-                  >
-                    <option value="citizen">Citizen</option>
-                    <option value="officer">Officer</option>
-                  </select>
-                </div>
-
-                <button
-                  type="submit"
-                  className="btn btn-primary btn-large btn-full"
+            <form onSubmit={handleSubmit} className="auth-form" noValidate>
+              <div className="field">
+                <label htmlFor="full_name" className="field__label">
+                  Full name <span className="field__required">*</span>
+                </label>
+                <input
+                  type="text"
+                  id="full_name"
+                  className="input"
+                  placeholder="Your name"
+                  value={formData.full_name}
+                  onChange={(e) => handleChange('full_name', e.target.value)}
+                  required
+                  autoComplete="name"
                   disabled={isLoading}
-                >
-                  {isLoading ? (
-                    <>
-                      <span className="spinner"></span>
-                      Creating account...
-                    </>
-                  ) : (
-                    'Create Account'
-                  )}
-                </button>
-              </form>
-
-              <div className="auth-footer">
-                <p>Already have an account? <Link to="/login">Sign in</Link></p>
+                />
               </div>
-            </div>
+
+              <div className="field">
+                <label htmlFor="email" className="field__label">
+                  Email <span className="field__required">*</span>
+                </label>
+                <input
+                  type="email"
+                  id="email"
+                  className="input"
+                  placeholder="you@example.com"
+                  value={formData.email}
+                  onChange={(e) => handleChange('email', e.target.value)}
+                  required
+                  autoComplete="email"
+                  disabled={isLoading}
+                />
+              </div>
+
+              <div className="field">
+                <label htmlFor="password" className="field__label">
+                  Password <span className="field__required">*</span>
+                </label>
+                <input
+                  type="password"
+                  id="password"
+                  className="input"
+                  placeholder="Create a password"
+                  value={formData.password}
+                  onChange={(e) => handleChange('password', e.target.value)}
+                  required
+                  autoComplete="new-password"
+                  disabled={isLoading}
+                />
+                <p className="field__hint">Minimum 8 characters.</p>
+              </div>
+
+              <div className="field">
+                <label htmlFor="confirmPassword" className="field__label">
+                  Confirm password <span className="field__required">*</span>
+                </label>
+                <input
+                  type="password"
+                  id="confirmPassword"
+                  className="input"
+                  placeholder="Repeat your password"
+                  value={formData.confirmPassword}
+                  onChange={(e) => handleChange('confirmPassword', e.target.value)}
+                  required
+                  autoComplete="new-password"
+                  disabled={isLoading}
+                />
+              </div>
+
+              <button
+                type="submit"
+                className="btn btn--primary btn--block btn--lg"
+                disabled={isLoading}
+              >
+                {isLoading ? (
+                  <>
+                    <span className="spinner" aria-hidden="true" />
+                    Creating account…
+                  </>
+                ) : (
+                  'Create Account'
+                )}
+              </button>
+            </form>
+
+            <p className="auth-card__switch">
+              Already have an account? <Link to="/login">Sign in</Link>
+            </p>
           </div>
         </div>
-      </main>
-
-      <footer className="footer">
-        <div className="container">
-          <p>&copy; 2026 CivicAI. Built for hackathon demo.</p>
-        </div>
-      </footer>
-    </div>
+      </section>
+    </PageShell>
   );
 }

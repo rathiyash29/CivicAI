@@ -122,6 +122,36 @@ def format_memory_complaint_id(sequence: int) -> str:
     return f"{MEMORY_ID_PREFIX}{sequence:06d}"
 
 
+def parse_complaint_id(public_id: str) -> int:
+    """
+    Inverse of `format_complaint_id`: `"CA-000042"` -> `42`.
+
+    The officer dashboard only ever sees the public `CA-` form, but the
+    intelligence routes key on the integer primary key. Without a parser the
+    dashboard cannot reach a complaint's priority evidence at all, so the two
+    forms have to be translatable in both directions.
+
+    A bare integer is accepted too, so a caller holding the primary key does not
+    have to format it first. Anything else raises `ValueError`, so a malformed
+    id is rejected rather than silently read as a different row. The in-memory
+    `CA-MEM-` form is rejected as well: those rows have no database identity to
+    look up.
+    """
+    text = str(public_id).strip().upper()
+    if text.isdigit():
+        return int(text)
+    if text.startswith(MEMORY_ID_PREFIX):
+        raise ValueError(
+            f"{public_id!r} is an in-memory complaint and has no database row"
+        )
+    if not text.startswith("CA-"):
+        raise ValueError(f"Not a complaint id: {public_id!r}")
+    digits = text[3:]
+    if not digits.isdigit():
+        raise ValueError(f"Not a complaint id: {public_id!r}")
+    return int(digits)
+
+
 def complaint_to_contract(
     complaint: models.Complaint,
     raw_location: Optional[str] = None,
@@ -129,7 +159,19 @@ def complaint_to_contract(
     """
     Project a database row onto the exact shape `/complaints` already returns.
 
-    Field names and types are the frontend contract and must not drift.
+    Field names and types are the frontend contract and must not drift. The
+    additions below are all read from columns the table already has; none of
+    them is derived, inferred or filled in, so a value that was never written
+    comes back as `None` and the UI can show it as unavailable.
+
+    `cluster_id` is the complaint's issue cluster. It was already stored
+    (`Complaint.cluster_id`) but not returned, which left the dashboard unable
+    to follow a complaint through to the hotspot and recommendation built from
+    it.
+
+    The four `analysis_*` fields are what the AI layer wrote at submission
+    time. They are the officer's answer to "what did the system understand
+    this complaint to be about", and they were stored and then never exposed.
     """
     return {
         "complaint_id": format_complaint_id(complaint.id),
@@ -147,6 +189,11 @@ def complaint_to_contract(
         "priority_level": complaint.priority_level,
         "status": complaint.status,
         "created_at": complaint.created_at,
+        "cluster_id": complaint.cluster_id,
+        "analysis_urgency": complaint.urgency,
+        "analysis_affected_group": complaint.affected_group,
+        "analysis_issue_summary": complaint.issue_summary,
+        "analysis_recommended_action": complaint.recommended_action,
     }
 
 
@@ -447,6 +494,44 @@ def list_user_complaints(
         return [complaint_to_contract(row) for row in rows]
     except SQLAlchemyError as exc:
         log.warning("Could not read complaints for %s: %s", auth_key_for(user), exc)
+        session.rollback()
+        return None
+    finally:
+        if not owned:
+            session.close()
+
+
+def list_all_complaints(
+    session: Optional[Session] = None,
+) -> Optional[list[dict]]:
+    """
+    Every complaint on the platform, newest first. Officer-facing counterpart to
+    `list_user_complaints`.
+
+    Same table, same projection, same ordering, same contract, so the citizen
+    route and this one cannot drift apart. Rows are shaped by
+    `complaint_to_contract`, which reads only complaint columns: the auth store
+    is never queried, so no password hash, JWT or other credential can reach
+    this response.
+
+    Returns None when PostgreSQL is unavailable, exactly like the citizen read,
+    so the caller can never turn "we could not check" into a confident empty
+    list. An empty list is only ever returned when the database answered.
+    """
+    owned = session is not None
+    if not owned:
+        if not database_available():
+            return None
+        session = SessionLocal()
+    try:
+        rows = (
+            session.query(models.Complaint)
+            .order_by(models.Complaint.created_at.desc(), models.Complaint.id.desc())
+            .all()
+        )
+        return [complaint_to_contract(row) for row in rows]
+    except SQLAlchemyError as exc:
+        log.warning("Could not read complaints for the officer dashboard: %s", exc)
         session.rollback()
         return None
     finally:

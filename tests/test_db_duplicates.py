@@ -208,3 +208,120 @@ def test_clustering_handles_complaints_with_no_location(clean_db):
 
 def test_clustering_nothing_to_do(clean_db):
     assert DD.cluster_all_unclustered(clean_db) == []
+
+
+# --- cluster statistics ------------------------------------------------------
+#
+# `IssueCluster.complaint_count` and `avg_severity_score` are a cache of the
+# complaints pointing at the cluster. The clustering code keeps them fresh while
+# it is the one assigning, but membership can also change by a route it never
+# sees (a data reload repointing `cluster_id`, a bulk fix), and a stale count
+# is then read straight back by the priority engine. These cover the repair
+# path and the places it has to hold.
+
+
+def test_cluster_stats_match_actual_members(clean_db, make_location):
+    loc = make_location("Kothrud")
+    _add(clean_db, PARAPHRASES[0][0], loc, severity="High")
+    _add(clean_db, PARAPHRASES[0][1], loc, severity="Low")
+    clean_db.commit()
+
+    DD.cluster_all_unclustered(clean_db)
+    cluster = clean_db.query(models.IssueCluster).one()
+
+    actual = clean_db.query(models.Complaint).filter_by(cluster_id=cluster.id).count()
+    assert cluster.complaint_count == actual == 2
+    assert cluster.avg_severity_score == 2.0
+
+
+def test_reassignment_updates_both_old_and_new_cluster(clean_db, make_location):
+    """A complaint moved to another cluster must leave the old one's count."""
+    loc = make_location("Kothrud")
+    first = _add(clean_db, PARAPHRASES[0][0], loc, severity="High")
+    second = _add(clean_db, PARAPHRASES[2][0], loc, severity="High")
+    clean_db.commit()
+
+    DD.cluster_all_unclustered(clean_db)
+    source, target = clean_db.query(models.IssueCluster).order_by(
+        models.IssueCluster.id).all()
+    assert source.id != target.id
+    assert source.complaint_count == 1 and target.complaint_count == 1
+
+    # Repoint the complaint the way a data reload would: outside the clustering
+    # code, so nothing refreshes either cluster.
+    first.cluster_id = target.id
+    clean_db.commit()
+    assert source.complaint_count == 1, "precondition: the cache is now stale"
+
+    DD.reconcile_cluster_stats(clean_db)
+
+    assert source.complaint_count == 0
+    assert source.avg_severity_score == 0.0
+    assert target.complaint_count == 2
+    assert second.cluster_id == target.id
+
+
+def test_orphaned_cluster_is_corrected_to_zero(clean_db, make_location):
+    """The live-database bug: a cluster kept claiming members it had lost."""
+    loc = make_location("Kothrud")
+    complaint = _add(clean_db, PARAPHRASES[0][0], loc, severity="High")
+    clean_db.commit()
+
+    DD.cluster_all_unclustered(clean_db)
+    cluster = clean_db.query(models.IssueCluster).one()
+    assert cluster.complaint_count == 1
+    assert cluster.avg_severity_score == 3.0
+
+    # Simulate the drift directly: the member leaves and nothing refreshes.
+    complaint.cluster_id = None
+    clean_db.commit()
+    assert cluster.complaint_count == 1, "precondition: cache is stale"
+
+    results = DD.reconcile_cluster_stats(clean_db)
+
+    assert cluster.complaint_count == 0
+    assert cluster.avg_severity_score == 0.0
+    assert results[0]["members_before"] == 1
+    assert results[0]["members_after"] == 0
+    assert results[0]["changed"] is True
+
+
+def test_reconcile_is_idempotent_and_does_not_delete_clusters(clean_db, make_location):
+    loc = make_location("Kothrud")
+    _add(clean_db, PARAPHRASES[0][0], loc)
+    _add(clean_db, PARAPHRASES[2][0], loc)
+    clean_db.commit()
+    DD.cluster_all_unclustered(clean_db)
+
+    before_ids = {c.id for c in clean_db.query(models.IssueCluster).all()}
+    DD.reconcile_cluster_stats(clean_db)
+    second_pass = DD.reconcile_cluster_stats(clean_db)
+
+    after_ids = {c.id for c in clean_db.query(models.IssueCluster).all()}
+    assert after_ids == before_ids, "an empty cluster is corrected, never deleted"
+    assert all(row["changed"] is False for row in second_pass), (
+        "a second pass over already-correct statistics must change nothing"
+    )
+
+
+def test_assign_cluster_refreshes_stats_of_an_already_clustered_complaint(
+    clean_db, make_location
+):
+    """
+    The early return for an already-clustered complaint still repairs the
+    cluster's cached count, so the request path cannot leave it stale.
+    """
+    loc = make_location("Kothrud")
+    complaint = _add(clean_db, PARAPHRASES[0][0], loc)
+    clean_db.commit()
+    cluster, created = DD.assign_cluster(clean_db, complaint)
+    assert created is True
+    assert cluster.complaint_count == 1
+
+    cluster.complaint_count = 99  # corrupted cache
+    clean_db.commit()
+
+    same, created_again = DD.assign_cluster(clean_db, complaint)
+    assert created_again is False
+    assert same.id == cluster.id
+    assert same.complaint_count == 1

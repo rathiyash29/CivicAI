@@ -133,3 +133,132 @@ def test_output_keys_match_the_mock_engine(clean_db, make_location):
     mine = set(DH.compute_hotspots(clean_db, min_complaints=1)[0])
     theirs = set(mock_hotspots.detect_hotspots()[0])
     assert theirs <= mine, f"missing keys the existing engine provides: {theirs - mine}"
+
+
+# --- cluster linkage (additive) ---------------------------------------------
+#
+# A hotspot is an aggregate over a (ward, category) scope; a cluster is a text
+# similarity group inside that same scope. So the join between them is by scope,
+# and it is 1:N -- one scope can hold several clusters. These pin that down so
+# a later "simplification" to a single cluster_id cannot slip in.
+
+
+def _cluster(db, ward, category, label="c"):
+    row = models.IssueCluster(label=label, ward=ward, category=category,
+                              complaint_count=0)
+    db.add(row)
+    db.commit()
+    return row
+
+
+def test_hotspot_cluster_ids_match_its_scope(clean_db, make_location):
+    loc = make_location("Kothrud")
+    _add(clean_db, loc, "Road Infrastructure", "High", n=4)
+    inside = _cluster(clean_db, "Kothrud", "Road Infrastructure")
+    clean_db.commit()
+
+    hs = DH.compute_hotspots(clean_db, min_complaints=1)[0]
+    assert hs["cluster_ids"] == [inside.id]
+
+
+def test_cluster_ids_is_always_a_list_even_when_empty(clean_db, make_location):
+    loc = make_location("Kothrud")
+    _add(clean_db, loc, "Road Infrastructure", "High", n=3)
+    clean_db.commit()
+
+    hs = DH.compute_hotspots(clean_db, min_complaints=1)[0]
+    assert isinstance(hs["cluster_ids"], list)
+    assert hs["cluster_ids"] == []
+
+
+def test_multiple_clusters_in_one_scope_all_appear(clean_db, make_location):
+    """
+    The 1:N case. Picking one cluster out of a scope would tell an officer a
+    fact the data does not support, so every id in the scope must be returned.
+    """
+    loc = make_location("Kothrud")
+    _add(clean_db, loc, "Road Infrastructure", "High", n=5)
+    first = _cluster(clean_db, "Kothrud", "Road Infrastructure", label="one")
+    second = _cluster(clean_db, "Kothrud", "Road Infrastructure", label="two")
+    third = _cluster(clean_db, "Kothrud", "Road Infrastructure", label="three")
+    clean_db.commit()
+
+    hs = DH.compute_hotspots(clean_db, min_complaints=1)[0]
+    assert hs["cluster_ids"] == [first.id, second.id, third.id]
+
+
+def test_clusters_from_other_wards_and_categories_are_excluded(clean_db, make_location):
+    kothrud = make_location("Kothrud")
+    baner = make_location("Baner")
+    _add(clean_db, kothrud, "Road Infrastructure", "High", n=3)
+    mine = _cluster(clean_db, "Kothrud", "Road Infrastructure")
+    _cluster(clean_db, "Baner", "Road Infrastructure")       # different ward
+    _cluster(clean_db, "Kothrud", "Water Supply")             # different category
+    clean_db.commit()
+
+    hs = DH.compute_hotspots(clean_db, min_complaints=1)[0]
+    assert hs["cluster_ids"] == [mine.id]
+
+
+def test_unassigned_hotspot_joins_unassigned_clusters(clean_db):
+    """The 'Unassigned' bucket is a real grouping key on both sides."""
+    _add(clean_db, None, "Road Infrastructure", "Medium", n=3)
+    inside = _cluster(clean_db, DH.UNASSIGNED_WARD, "Road Infrastructure")
+    clean_db.commit()
+
+    hs = DH.compute_hotspots(clean_db, min_complaints=1)[0]
+    assert hs["location"] == "Unassigned"
+    assert hs["cluster_ids"] == [inside.id]
+
+
+def test_cluster_ids_match_the_clustering_engine(clean_db, make_location):
+    """End to end: clusters created by db_duplicates are the ones linked."""
+    from backend import db_duplicates as DD
+
+    loc = make_location("Kothrud")
+    for text in ("huge potholes on the road", "road full of potholes, dangerous",
+                 "no water supply for two days", "water supply missing in colony"):
+        clean_db.add(models.Complaint(text=text, category="Road Infrastructure",
+                                      severity="Medium", urgency="Medium",
+                                      location_id=loc.id))
+    clean_db.commit()
+    DD.cluster_all_unclustered(clean_db)
+
+    expected = sorted(c.id for c in clean_db.query(models.IssueCluster)
+                      .filter_by(ward="Kothrud", category="Road Infrastructure").all())
+    hs = DH.compute_hotspots(clean_db, min_complaints=1)[0]
+    assert hs["cluster_ids"] == expected
+    assert hs["cluster_ids"], "the engine created clusters, so the join must find them"
+
+
+# --- location passthrough (additive) ----------------------------------------
+
+
+def test_coordinates_are_passed_through_when_present(clean_db, make_location):
+    loc = make_location("Kothrud")
+    loc.latitude = 18.5074
+    loc.longitude = 73.8077
+    loc.area = "Kothrud East"
+    clean_db.commit()
+    _add(clean_db, loc, "Road Infrastructure", "High", n=3)
+
+    hs = DH.compute_hotspots(clean_db, min_complaints=1)[0]
+    assert hs["latitude"] == 18.5074
+    assert hs["longitude"] == 73.8077
+    assert hs["area"] == "Kothrud East"
+
+
+def test_coordinates_are_null_not_invented_when_missing(clean_db, make_location):
+    loc = make_location("Kothrud")  # no latitude/longitude/area recorded
+    _add(clean_db, loc, "Road Infrastructure", "High", n=3)
+
+    hs = DH.compute_hotspots(clean_db, min_complaints=1)[0]
+    assert hs["latitude"] is None
+    assert hs["longitude"] is None
+    assert hs["area"] is None
+
+
+def test_unassigned_hotspot_has_no_location_record(clean_db):
+    _add(clean_db, None, "Road Infrastructure", "Medium", n=3)
+    hs = DH.compute_hotspots(clean_db, min_complaints=1)[0]
+    assert (hs["area"], hs["latitude"], hs["longitude"]) == (None, None, None)

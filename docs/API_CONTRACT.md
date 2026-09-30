@@ -207,7 +207,8 @@ Authorization: Bearer <access_token>
       "investment_gap": "number"
     }
   },
-  "ai_provider": "mock | gemini",
+  "ai_provider": "gemini | mock",
+  "fallback_reason": "quota_exhausted | api_error | invalid_response | not_configured | unexpected_error | null",
   "duplicate": {
     "success": true,
     "is_duplicate": "boolean",
@@ -216,6 +217,29 @@ Authorization: Bearer <access_token>
   }
 }
 ```
+
+**`ai_provider` reports the provider that ACTUALLY ran, not the configured one.**
+
+`AI_PROVIDER` in the environment is only a *preference*. When Gemini is
+unavailable the backend falls back to its offline keyword engine, and this
+field reports `"mock"` in that case. It is deliberately not the configured
+value, because reporting the preference would claim real AI that never
+executed and leave a client with no way to tell the difference.
+
+**`fallback_reason` is populated only when a fallback occurred**; it is `null`
+when Gemini answered normally. The values are a fixed, coarse vocabulary:
+
+| Value | Meaning |
+|-------|---------|
+| `quota_exhausted` | The provider's quota was exhausted (HTTP 429). On the free tier this is a *daily* per-project allowance, so it is not retried. |
+| `api_error` | Any other provider-side failure: authentication, permission, a rejected request, a network error. |
+| `invalid_response` | The provider answered, but the payload was empty, not JSON, not an object, or missing a required field. |
+| `not_configured` | The Gemini provider was selected but no API key was available. |
+| `unexpected_error` | A failure outside the provider call itself, e.g. a programming fault. |
+
+These codes are safe to return over HTTP. The raw vendor error message, the
+provider's project identifiers and the API key are **never** included in any
+response; they are logged server-side only.
 
 **Response (Unauthenticated - 200 OK):**
 ```json
@@ -229,7 +253,8 @@ Authorization: Bearer <access_token>
   },
   "analysis": { ... },
   "priority": { ... },
-  "ai_provider": "mock | gemini",
+  "ai_provider": "gemini | mock",
+  "fallback_reason": "string | null",
   "duplicate": { ... }
 }
 ```
@@ -237,6 +262,7 @@ Authorization: Bearer <access_token>
 **Behavior:**
 - When authenticated: Complaint is stored in database, associated with user, and full analysis/priority/duplicate data returned
 - When unauthenticated: Complaint is processed but not stored, legacy response format returned
+- `ai_provider` and `fallback_reason` follow the same rules on both paths, as described above
 
 **Owner:** Member 1 (citizen complaint flow)
 
@@ -271,12 +297,32 @@ Authorization: Bearer <access_token>
       "priority_score": "number",
       "priority_level": "Low | Medium | High",
       "status": "Submitted",
-      "created_at": "2026-01-15T10:30:00Z"
+      "created_at": "2026-01-15T10:30:00Z",
+      "cluster_id": 12,
+      "analysis_urgency": "Low | Medium | High | null",
+      "analysis_affected_group": "string | null",
+      "analysis_issue_summary": "string | null",
+      "analysis_recommended_action": "string | null"
     }
   ],
   "total": 1
 }
 ```
+
+**The five `analysis_*` and `cluster_id` fields are additive.** The original
+eleven fields are unchanged in name and type, so the existing citizen frontend
+keeps working against this same shape.
+
+They are read from columns the complaint row already had. The `analysis_*`
+fields are what the AI layer wrote at submission time and are the officer's
+answer to "what did the system understand this to be about". `cluster_id` is the
+issue cluster the complaint was grouped into, which is the join from one
+complaint to the hotspot and recommendation built from it.
+
+Every one of them is **nullable, and null means exactly that**: a complaint
+created before these were written, or through a path that skipped analysis, has
+no value. Nothing is derived, inferred or back-filled, so a null here means
+"not recorded" rather than "not applicable".
 
 **Error Responses:**
 - 401: Could not validate credentials
@@ -289,7 +335,7 @@ Authorization: Bearer <access_token>
 
 ### POST /complaints/analyze
 
-**Purpose:** Analyze a complaint using the configured AI provider (mock or Gemini).
+**Purpose:** Analyze a complaint, reporting the provider that actually answered.
 
 **Method:** POST
 
@@ -318,9 +364,21 @@ Authorization: Bearer <access_token>
     "issue_summary": "string",
     "recommended_action": "string"
   },
-  "ai_provider": "mock | gemini"
+  "ai_provider": "gemini | mock",
+  "fallback_reason": "string | null"
 }
 ```
+
+`ai_provider` keeps its original name but is now the provider that **actually
+ran**, not the `AI_PROVIDER` preference the process was configured with — a
+deployment configured for Gemini that fell back reports `"mock"`. A successful
+Gemini call reports `"gemini"` with `fallback_reason` `null`; a mock fallback
+reports `"mock"` with the reason it fell back.
+
+`ai_provider` and `fallback_reason` are top-level fields here, as on
+`POST /complaints`. `analysis` also carries `provider_used` and, when a
+fallback occurred, `fallback_reason`; those are additive and every field listed
+above keeps its existing name and type.
 
 **Owner:** Member 1 (AI analysis)
 
@@ -368,9 +426,14 @@ Authorization: Bearer <access_token>
       "investment_gap": "number"
     }
   },
-  "ai_provider": "mock | gemini"
+  "ai_provider": "gemini | mock",
+  "fallback_reason": "string | null"
 }
 ```
+
+`ai_provider` and `fallback_reason` follow the same rules as on
+`POST /complaints`. `analysis` also carries `provider_used` and, when a
+fallback occurred, `fallback_reason`.
 
 **Owner:** Member 1 (analysis), Member 2 (priority calculation)
 
@@ -535,7 +598,7 @@ AI_PROVIDER=mock
    ```
 3. Each developer creates their own `.env` locally
 4. `GEMINI_API_KEY` is only needed when `AI_PROVIDER=gemini`
-5. `JWT_SECRET_KEY` must be a secure random string (generate with: `python -c "import secrets; print(secrets.token_urlsafe(32))"`)
+5. `JWT_SECRET_KEY` must be a secure random string (generate with: `python -c "import secrets; print(secrets.token_urlsafe(32))"`). When unset, `backend/auth.py` signs tokens with a random per-process key and warns that they will not survive a restart.
 
 ### Switching Providers
 
@@ -554,6 +617,263 @@ GEMINI_API_KEY=your_actual_key
 - **Gemini 403 PERMISSION_DENIED**: Some Google AI projects may not have Generative Language API access enabled. If you encounter 403, the system will automatically fall back to the mock provider and log a warning. Ensure your Google Cloud project has the "Generative Language API" enabled and billing configured if required.
 - **API Key Security**: The API key is never logged, exposed in responses, or included in error messages.
 - **Fallback Behavior**: On any Gemini failure (missing key, auth error, quota, network, JSON parsing), the mock analyzer is used transparently.
+
+---
+
+## OFFICER INTELLIGENCE ENDPOINTS
+
+Everything in this section lives under `/intelligence` and is **officer-only**:
+401 without a usable token, 403 for a citizen. These are the endpoints the
+government dashboard reads, and between them they cover the pipeline
+complaint → analysis → cluster → hotspot → recommendation.
+
+### GET /intelligence/clusters/{cluster_id}
+
+**Purpose:** One issue cluster, with the ids of the complaints grouped into it.
+The head of the case file the government dashboard shows at
+`/dashboard/case/:cluster_id`.
+
+**Method:** GET
+
+**URL:** `/intelligence/clusters/{cluster_id}`
+
+**Response (200 OK):**
+```json
+{
+  "cluster_id": 1,
+  "label": "Road Infrastructure - Kothrud #1",
+  "category": "Road Infrastructure",
+  "ward": "Kothrud",
+  "complaint_count": 12,
+  "complaint_ids": [8, 10, 11, 14, 15, 16, 18, 20, 22, 32, 34, 36],
+  "created_at": "2026-09-27T19:15:15.382925"
+}
+```
+
+**This is a strict read.** It returns the cluster's own columns untouched and
+lists member ids with an ordered select. No clustering, scoring or
+recommendation is run here, so opening a case file cannot change any number in
+it.
+
+**Why it exists.** A cluster's `category` and `ward` are plain string columns
+with no foreign key, so they were reachable from nowhere else: a hotspot lists
+cluster *ids* but not their category, and a recommendation carries the ward but
+not the category. A client without this endpoint would have had to infer the
+category from the recommended action text — a guess presented as fact.
+
+`complaint_count` is counted from the complaint rows rather than read from
+`IssueCluster.complaint_count`. That column is a cache maintained by the
+clustering code, so trusting it would let the case header disagree with the
+complaints listed beneath it. `ward` is the literal `"Unassigned"` when the
+complaints never resolved to a known ward, which is a real answer rather than a
+gap.
+
+**Error Responses:**
+- 401 / 403: not an officer
+- 404: no cluster with that id
+
+---
+
+### GET /intelligence/stats
+
+Row counts per table, plus derived counts for the stages that have no table of
+their own. Used by the Overview pipeline.
+
+**Response (200 OK):**
+```json
+{
+  "locations": 10,
+  "complaints": 15,
+  "scored_complaints": 15,
+  "issue_clusters": 11,
+  "infrastructure": 60,
+  "demographics": 10,
+  "investments": 180,
+  "recommendations": 9,
+
+  "analysed_complaints": 15,
+  "hotspots": 1,
+  "projects": 3,
+  "completed_projects": 2,
+  "measured_impact": 1
+}
+```
+
+The first eight keys are per-table counts and are unchanged. The rest are:
+
+| Key | What it counts |
+|-----|----------------|
+| `analysed_complaints` | Complaints with a non-null `issue_summary`, i.e. ones the AI layer actually wrote a reading for. Counting the column is the honest test; counting every complaint would report the stage complete when it never ran. |
+| `hotspots` | `db_hotspots.compute_hotspots` at `DEFAULT_MIN_COMPLAINTS`, so this and the Hotspots page cannot disagree. |
+| `projects` / `completed_projects` | Rows in `projects`, and those in `Completed` status. |
+| `measured_impact` | Rows in `project_impacts`. |
+
+**These are not cumulative.** A cluster groups complaints, it does not consume
+them, so `issue_clusters` may exceed or fall below any count beside it.
+
+---
+
+### GET /intelligence/priority/{complaint_id}/explanation
+
+**Purpose:** The five weighted factors behind a complaint's stored priority
+score, plus the evidence used to derive them. Backs "Why this score?" in the
+officer's complaint detail view.
+
+**Method:** GET
+
+**URL:** `/intelligence/priority/{complaint_id}/explanation`
+
+`complaint_id` accepts the public `CA-000042` form, a bare integer, or both. The
+`CA-MEM-` form is refused with 404: an in-memory complaint has no database row to
+explain.
+
+**Response (200 OK):**
+```json
+{
+  "complaint_id": 42,
+  "stored_score": 72.4,
+  "stored_level": "High",
+  "current_score": 72.4,
+  "factors": {
+    "citizen_demand": 71.0,
+    "infrastructure_gap": 80.0,
+    "population_impact": 65.0,
+    "urgency": 90.0,
+    "investment_gap": 40.0
+  },
+  "weights": {
+    "citizen_demand": 0.30,
+    "infrastructure_gap": 0.25,
+    "population_impact": 0.20,
+    "urgency": 0.15,
+    "investment_gap": 0.10
+  },
+  "evidence": {
+    "citizen_demand_basis": "cluster",
+    "complaints_in_demand_group": 6,
+    "infrastructure_gap_source": "database",
+    "investment_gap_source": "database",
+    "population_impact_source": "database"
+  }
+}
+```
+
+**This endpoint is a read and changes nothing.** It calls the same
+`db_priority.compute_factors` that `compute_priority` weights, and it does not
+write, rescore or otherwise modify the complaint. Looking at a complaint's score
+does not move that score.
+
+`factors` and `weights` are read straight from `db_priority`, so this cannot
+drift from the algorithm. **`*_source` is `"database"` when the value came from a
+real ward row and `"default"` when no location resolved**, in which case the
+engine used a neutral constant: honest, but weaker evidence, and labelled as
+such.
+
+`stored_score` is the score on the complaint row, which is the one the dashboard
+displays. `current_score` is what the same factors would produce now; they are
+equal unless the underlying data moved since the complaint was scored. An
+unscored complaint reports `stored_score: null` and still gets a `current_score`,
+but no score is written by asking.
+
+**Error Responses:**
+- 401 / 403: not an officer
+- 404: no such complaint, or an id this endpoint cannot resolve
+
+---
+
+### GET /intelligence/recommendations/{cluster_id}
+
+**Purpose:** The single recommendation generated from one issue cluster, the same
+object as one entry of the list endpoint.
+
+**Response:** identical to one element of `GET /intelligence/recommendations`.
+
+**Error Responses:**
+- 404: no such cluster, or the cluster has no complaints and so no recommendation
+
+Note that this route reads the cluster and **upserts** its `Recommendation` row
+through `generate_recommendation`, exactly as the list endpoint does for every
+cluster. That is pre-existing behaviour of the recommendations routes, not new
+here, and it is why the case file treats `recommendation` as "what the engine
+currently holds" rather than as a frozen historical record.
+
+---
+
+### GET /intelligence/recommendations
+
+**Response (200 OK):**
+```json
+{
+  "recommendations": [
+    {
+      "recommendation_id": 4,
+      "cluster_id": 1,
+      "location": "Kothrud",
+      "action": "string",
+      "reason": "string",
+      "evidence": {
+        "related_complaints": 12,
+        "high_severity_complaints": 5,
+        "infrastructure_gap": "High",
+        "population_impact": "High",
+        "investment_gap": "Medium"
+      },
+      "priority_score": 80.0,
+      "priority_level": "High",
+      "estimated_affected_population": 17700
+    }
+  ]
+}
+```
+
+**`recommendation_id` is additive and is the row's own primary key** — the value
+the officer decision endpoints are called with
+(`/projects/recommendations/{recommendation_id}/approve`). It was previously
+absent, so a client could read a recommendation's evidence and then have no id to
+decide on.
+
+**`cluster_id` is unchanged and is a different thing:** the issue cluster the
+recommendation was generated from, and the key `cluster_ids[]` on a hotspot
+already carries. They are not interchangeable, and using one where the other
+belongs would act on the wrong row.
+
+`evidence` values are band labels ("High" / "Medium" / "Low"); the underlying
+factor numbers for a *recommendation* are not serialised. The raw numbers are
+available per complaint via the explanation endpoint above.
+
+**Owner:** Member 2 (analytics engine), Member 3 (dashboard)
+
+---
+
+## PROJECT AND IMPACT ENDPOINTS
+
+Officer-only, and mounted at the **root** (no prefix), because the router
+declares these paths itself.
+
+### GET /impact
+
+**Purpose:** Every recorded impact measurement, so a client can tell a measured
+project from one still awaiting measurement in a single request.
+
+**Response (200 OK):**
+```json
+{
+  "impacts": [ { "id": 1, "project_id": 2, "observed_change": { "...": "..." } } ],
+  "measured_project_ids": [2]
+}
+```
+
+`impacts` holds the same objects as `GET /projects/{project_id}/impact`, newest
+first. `measured_project_ids` is the same set projected onto project ids.
+
+**Only completed projects are included,** matching the state an impact record is
+legal in; the backend refuses to record one for any other status. A project
+absent from `measured_project_ids` genuinely has no record — that is the only
+condition under which "awaiting measurement" is accurate, and it is why
+`GET /impact` exists rather than treating every unqueried project as unmeasured.
+
+**Error Responses:**
+- 401 / 403: not an officer
 
 ---
 

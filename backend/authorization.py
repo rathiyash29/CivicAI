@@ -15,9 +15,11 @@ from typing import Optional
 
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
+from sqlalchemy.orm import Session
 
 from backend import auth as auth_module
 from backend.auth import UserResponse, UserRole, decode_access_token
+from database.db import get_db
 
 # auto_error=False so a missing Authorization header reaches the dependency
 # below and becomes a clean 401 instead of FastAPI's own error shape.
@@ -34,13 +36,21 @@ def _unauthorized() -> HTTPException:
     )
 
 
-async def get_current_user(token: Optional[str] = Depends(oauth2_scheme)) -> UserResponse:
+async def get_current_user(
+    token: Optional[str] = Depends(oauth2_scheme),
+    db: Session = Depends(get_db),
+) -> UserResponse:
     """
     The authenticated user, or 401.
 
-    A token with no matching account is a 401 even if it is a validly signed
-    JWT: the in-memory account store is empty after a restart, and treating
-    that as "anonymous" would silently drop the identity.
+    The account is re-read from PostgreSQL on every request rather than trusted
+    from the token. That costs one indexed lookup and buys the property that a
+    token is only proof of *which* account: a role that changed, or an account
+    that was deleted, takes effect immediately instead of at token expiry.
+
+    A validly signed token with no matching account is still a 401. That happens
+    when the account was deleted, and treating it as anonymous would silently
+    drop the identity instead of failing.
     """
     # With auto_error=False a request with no Authorization header arrives here
     # with token=None. Passing None into jose raises AttributeError, which
@@ -50,35 +60,39 @@ async def get_current_user(token: Optional[str] = Depends(oauth2_scheme)) -> Use
     token_data = decode_access_token(token)
     if token_data is None:
         raise _unauthorized()
-    # Read the account store through the module, not a name bound at import
-    # time, so the store is always the live one.
-    if token_data.email.isdigit():
-        user = auth_module.get_user_by_id(int(token_data.email))
-    else:
-        user = None
-    if user is None:
-        user = next((u for u in auth_module.MOCK_USERS_DB.values()
-                     if u.email == token_data.email), None)
-    if user is None:
-        raise _unauthorized()
-    return UserResponse(
-        id=user.id,
-        full_name=user.full_name,
-        email=user.email,
-        role=user.role,
-        created_at=user.created_at,
+
+    # `sub` is the account email. A purely numeric subject is still accepted so
+    # a token minted by an older build that used the row id keeps working.
+    subject = token_data.email or ""
+    row = (
+        auth_module.get_user_by_id(db, int(subject))
+        if subject.isdigit()
+        else auth_module.get_user_by_email(db, subject)
     )
+    if row is None:
+        raise _unauthorized()
+    return auth_module.to_response(row)
 
 
 async def get_current_user_optional(
     token: Optional[str] = Depends(oauth2_scheme),
+    db: Session = Depends(get_db),
 ) -> Optional[UserResponse]:
-    """The authenticated user, or None. Used by endpoints with a legacy
-    anonymous path that must keep working."""
+    """
+    The authenticated user, or None.
+
+    Used by endpoints with a legacy anonymous path that must keep working. A
+    bad or absent token is None here rather than 401, which is the whole point
+    of the optional variant.
+
+    `get_current_user` is invoked directly rather than through `Depends`, so
+    both of its parameters have to be passed explicitly. Getting this wrong
+    silently passed the token string in as the database session.
+    """
     if not token:
         return None
     try:
-        return await get_current_user(token)
+        return await get_current_user(token, db)
     except HTTPException:
         return None
 

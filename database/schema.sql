@@ -6,9 +6,12 @@ CREATE TABLE IF NOT EXISTS users (
     id SERIAL PRIMARY KEY,
     name VARCHAR(120),
     email VARCHAR(255) UNIQUE,
-    -- Stable identity of the mirrored auth account. The auth module's integer
-    -- id restarts from 1 on every process restart, so it is never used here.
+    -- Stable identity of the account, used for complaint ownership.
     auth_key VARCHAR(255) UNIQUE,
+    -- bcrypt hash. NULL for rows that predate database-backed auth; such a row
+    -- cannot log in. Added by scripts/migrate_add_password_hash.py on an
+    -- existing database.
+    password_hash VARCHAR(255),
     role VARCHAR(20) DEFAULT 'citizen',
     created_at TIMESTAMP DEFAULT NOW()
 );
@@ -98,8 +101,23 @@ CREATE TABLE IF NOT EXISTS projects (
     id SERIAL PRIMARY KEY,
     recommendation_id INTEGER REFERENCES recommendations(id),
     title VARCHAR(200),
+    description TEXT,
     status VARCHAR(30) DEFAULT 'Under Review',
     officer_id INTEGER REFERENCES users(id),
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Append-only ledger of officer decisions. A rejection creates no project, and a
+-- modification must not overwrite the engine's recommendation, so neither can be
+-- recorded on the projects or recommendations tables alone.
+CREATE TABLE IF NOT EXISTS officer_decisions (
+    id SERIAL PRIMARY KEY,
+    recommendation_id INTEGER REFERENCES recommendations(id),
+    project_id INTEGER REFERENCES projects(id),
+    officer_id INTEGER REFERENCES users(id),
+    decision VARCHAR(30),
+    reason TEXT,
+    action_snapshot VARCHAR(300),
     created_at TIMESTAMP DEFAULT NOW()
 );
 

@@ -1,4 +1,13 @@
-export const API_BASE = 'http://127.0.0.1:8000';
+/**
+ * Authentication for the citizen frontend.
+ *
+ * `API_BASE` is resolved from `VITE_API_BASE_URL` (see `api/client.ts`), so the
+ * backend origin is environment-configurable. In local development the Vite
+ * dev server is same-origin and the value is empty, which means these calls
+ * go to the page's own origin and no CORS configuration is needed on the
+ * backend.
+ */
+import { API_BASE, TOKEN_STORAGE_KEY, normalizeErrorMessage } from './client'
 
 export interface User {
   id: number;
@@ -13,16 +22,38 @@ export interface AuthTokens {
   token_type: string;
 }
 
+/**
+ * Public registration payload.
+ *
+ * There is deliberately no `role` field. Officer accounts are provisioned out
+ * of band, and the public route rejects any request that asks for one, so the
+ * client cannot offer it in the first place.
+ */
 export interface RegisterRequest {
   full_name: string;
   email: string;
   password: string;
-  role?: 'citizen' | 'officer';
 }
 
 export interface LoginRequest {
   email: string;
   password: string;
+}
+
+/**
+ * Read a failure response and turn it into one readable sentence.
+ *
+ * Always resolves to a string so a caller can never end up rendering
+ * "[object Object]" from a structured 422 payload.
+ */
+async function readFailure(response: Response, fallback: string): Promise<string> {
+  try {
+    const body = await response.json()
+    return normalizeErrorMessage(body, fallback)
+  } catch {
+    // Non-JSON error body (proxy failure, HTML page, empty response).
+    return normalizeErrorMessage(null, fallback)
+  }
 }
 
 export async function registerUser(data: RegisterRequest): Promise<User> {
@@ -33,8 +64,7 @@ export async function registerUser(data: RegisterRequest): Promise<User> {
   });
 
   if (!response.ok) {
-    const errorData = await response.json().catch(() => ({}));
-    throw new Error(errorData.detail || 'Registration failed');
+    throw new Error(await readFailure(response, 'Registration failed. Please try again.'));
   }
 
   return response.json();
@@ -48,8 +78,7 @@ export async function loginUser(data: LoginRequest): Promise<AuthTokens> {
   });
 
   if (!response.ok) {
-    const errorData = await response.json().catch(() => ({}));
-    throw new Error(errorData.detail || 'Login failed');
+    throw new Error(await readFailure(response, 'Sign-in failed. Please try again.'));
   }
 
   return response.json();
@@ -68,13 +97,13 @@ export async function getCurrentUser(token: string): Promise<User> {
 }
 
 export function saveAuthToken(token: string): void {
-  localStorage.setItem('auth_token', token);
+  localStorage.setItem(TOKEN_STORAGE_KEY, token);
 }
 
 export function getAuthToken(): string | null {
-  return localStorage.getItem('auth_token');
+  return localStorage.getItem(TOKEN_STORAGE_KEY);
 }
 
 export function clearAuthToken(): void {
-  localStorage.removeItem('auth_token');
+  localStorage.removeItem(TOKEN_STORAGE_KEY);
 }

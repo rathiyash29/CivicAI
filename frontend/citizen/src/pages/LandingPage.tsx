@@ -1,143 +1,232 @@
-import { useNavigate } from 'react-router-dom';
 import { Link } from 'react-router-dom';
-import { useAuth } from '../context/AuthContext';
+import { PageShell } from '../components/PageShell';
+import {
+  IconArrowRight,
+  IconChart,
+  IconCheckCircle,
+  IconClock,
+  IconGlobe,
+  IconMapPin,
+  IconMic,
+  IconShield,
+  IconTag,
+  IconText,
+  IconUsers,
+} from '../components/Icons';
 import './LandingPage.css';
 
-export function LandingPage() {
-  const navigate = useNavigate();
-  const { isAuthenticated, user } = useAuth();
-
-  const handleReportClick = () => {
-    navigate('/complaint');
-  };
-
+/**
+ * The report panel on the right of the hero.
+ *
+ * It is deliberately a static preview, not a form: the textarea-looking block
+ * and the pills are presentation only (`aria-hidden`), so a resident cannot type
+ * into something that does nothing. The single real control is the "Start a
+ * Report" link to the report page. Nothing here is a dead control.
+ */
+function ReportPanel() {
   return (
-    <div className="landing-page">
-      <header className="header">
+    <aside className="report-panel" aria-labelledby="report-panel-title">
+      <span className="report-panel__eyebrow">Start a report</span>
+      <h2 className="report-panel__title" id="report-panel-title">
+        What is happening in your community?
+      </h2>
+
+      <div className="report-panel__preview" aria-hidden="true">
+        <div className="report-panel__field">
+          <span className="report-panel__field-icon">
+            <IconText size={16} />
+          </span>
+          <span className="report-panel__field-text">
+            Describe the problem in your own words
+          </span>
+          <span className="report-panel__mic">
+            <IconMic size={15} />
+            Voice
+          </span>
+        </div>
+        <div className="report-panel__field">
+          <span className="report-panel__field-icon">
+            <IconMapPin size={16} />
+          </span>
+          <span className="report-panel__field-text">
+            Add your area or a nearby landmark
+          </span>
+        </div>
+      </div>
+
+      <Link to="/complaint" className="btn btn--accent btn--block">
+        Start a Report
+        <IconArrowRight size={17} />
+      </Link>
+
+      <p className="report-panel__note">
+        Write or speak in English, Hindi or Marathi.
+      </p>
+    </aside>
+  );
+}
+
+const ASSURANCES = [
+  { Icon: IconGlobe, title: 'English, Hindi, Marathi', body: 'Report in the language you speak.' },
+  { Icon: IconMic, title: 'Text or voice', body: 'Type it, or simply speak your report.' },
+  { Icon: IconClock, title: 'Track your requests', body: 'Follow each report you have submitted.' },
+  { Icon: IconCheckCircle, title: 'Free for every resident', body: 'No cost and no account needed to report.' },
+];
+
+/**
+ * The CivicAI pipeline.
+ *
+ * Requirement 3 asked for a REPORT → UNDERSTAND → AGGREGATE → PRIORITIZE →
+ * DECIDE workflow, and requirement 4 asked to keep the existing five-step
+ * explanation. Those are the same five stages, so they are one section rather
+ * than two: a stage rail carrying the full explanation. The `how-it-works` id
+ * keeps the header anchor and the "See How It Works" button working.
+ */
+const STAGES = [
+  {
+    Icon: IconText,
+    title: 'Report',
+    body: 'A resident submits a local issue by text or voice, in English, Hindi or Marathi, together with its location.',
+  },
+  {
+    Icon: IconChart,
+    title: 'Understand',
+    body: 'CivicAI reads the report and identifies its category, severity, urgency and the community affected.',
+  },
+  {
+    Icon: IconUsers,
+    title: 'Aggregate',
+    body: 'Similar reports from the same area are grouped, so a single voice becomes many and recurring problems become visible.',
+  },
+  {
+    Icon: IconTag,
+    title: 'Prioritize',
+    body: 'Citizen demand, infrastructure gaps, population impact, urgency and investment combine into an evidence-based priority.',
+  },
+  {
+    Icon: IconShield,
+    title: 'Decide',
+    body: 'Government officers review the evidence and decide what to do.',
+  },
+];
+
+export function LandingPage() {
+  return (
+    <PageShell>
+      {/* Hero ------------------------------------------------------- */}
+      <section className="hero">
+        <div className="container hero__inner">
+          <div className="hero__copy">
+            <span className="eyebrow">CivicAI Citizen Portal</span>
+            <h1 className="hero__title">
+              Your Voice. Your Community.
+              <br />
+              Your Priorities.
+            </h1>
+            <p className="hero__lead">
+              Report local infrastructure and community issues in your preferred
+              language. CivicAI reads every report, groups the ones that share a
+              cause, and turns them into clear priorities your local government
+              can act on.
+            </p>
+
+            <div className="hero__actions">
+              <Link to="/complaint" className="btn btn--primary btn--lg">
+                Report an Issue
+              </Link>
+              <a href="#how-it-works" className="btn btn--secondary btn--lg">
+                See How It Works
+              </a>
+            </div>
+
+            <ul className="hero__points">
+              <li>
+                <IconCheckCircle size={17} />
+                English, Hindi and Marathi
+              </li>
+              <li>
+                <IconCheckCircle size={17} />
+                Write it or speak it
+              </li>
+              <li>
+                <IconCheckCircle size={17} />
+                Track every request you make
+              </li>
+            </ul>
+          </div>
+
+          <ReportPanel />
+        </div>
+      </section>
+
+      {/* Assurances ------------------------------------------------- */}
+      <section className="assurances" aria-label="What reporting with CivicAI gives you">
         <div className="container">
-          <div className="logo">CivicAI</div>
-          <nav className="nav">
-            <a href="#how-it-works" className="nav-link">How It Works</a>
-            {isAuthenticated ? (
-              <>
-                <Link to="/my-complaints" className="nav-link">My Complaints</Link>
-                <Link to="/complaint" className="btn btn-primary">Report a Problem</Link>
-                <span className="user-info" style={{ color: '#64748b', marginLeft: '1rem', fontSize: '0.9rem' }}>
-                  {user?.full_name}
+          <ul className="assurances__grid">
+            {ASSURANCES.map((item) => (
+              <li className="assurance" key={item.title}>
+                <span className="assurance__icon" aria-hidden="true">
+                  <item.Icon size={19} />
                 </span>
-              </>
-            ) : (
-              <>
-                <Link to="/login" className="nav-link">Sign In</Link>
-                <Link to="/register" className="btn btn-primary">Get Started</Link>
-              </>
-            )}
-          </nav>
+                <div>
+                  <h3 className="assurance__title">{item.title}</h3>
+                  <p className="assurance__body">{item.body}</p>
+                </div>
+              </li>
+            ))}
+          </ul>
         </div>
-      </header>
+      </section>
 
-      <main className="main">
-        <section className="hero">
-          <div className="container">
-            <div className="hero-content">
-              <h1 className="hero-title">CivicAI</h1>
-              <p className="hero-tagline">"Your Voice. Your Community. Your Future."</p>
-              <p className="hero-description">
-                CivicAI empowers citizens to report local development and infrastructure problems 
-                in their preferred language. Our AI-powered platform analyzes community feedback 
-                to help authorities understand and prioritize community needs effectively.
-              </p>
-              <button className="btn btn-primary btn-large" onClick={handleReportClick}>
-                Report a Problem
-              </button>
-            </div>
-            <div className="hero-visual">
-              <div className="visual-card">
-                <div className="visual-icon">📍</div>
-                <h3>Report Issues</h3>
-                <p>Submit complaints in your language</p>
-              </div>
-              <div className="visual-card">
-                <div className="visual-icon">🤖</div>
-                <h3>AI Analysis</h3>
-                <p>Smart categorization & priority</p>
-              </div>
-              <div className="visual-card">
-                <div className="visual-icon">📊</div>
-                <h3>Actionable Insights</h3>
-                <p>Data-driven decisions for authorities</p>
-              </div>
-            </div>
-          </div>
-        </section>
-
-        <section id="how-it-works" className="how-it-works">
-          <div className="container">
-            <h2 className="section-title">How CivicAI Works</h2>
-            <div className="steps">
-              <div className="step">
-                <div className="step-number">1</div>
-                <h3>Submit Report</h3>
-                <p>Describe the issue in your preferred language — English, Hindi, or Marathi. Add location details and optionally use voice input.</p>
-              </div>
-              <div className="step">
-                <div className="step-number">2</div>
-                <h3>AI Analysis</h3>
-                <p>Our AI automatically categorizes the issue, assesses severity and urgency, identifies affected groups, and recommends actions.</p>
-              </div>
-              <div className="step">
-                <div className="step-number">3</div>
-                <h3>Authorities Act</h3>
-                <p>Local authorities receive structured, prioritized insights to make data-driven decisions and allocate resources effectively.</p>
-              </div>
-            </div>
-          </div>
-        </section>
-
-        <section className="features">
-          <div className="container">
-            <h2 className="section-title">Key Features</h2>
-            <div className="features-grid">
-              <div className="feature">
-                <div className="feature-icon">🌐</div>
-                <h3>Multilingual Support</h3>
-                <p>Report in English, Hindi, or Marathi. More languages coming soon.</p>
-              </div>
-              <div className="feature">
-                <div className="feature-icon">🎤</div>
-                <h3>Voice Input Ready</h3>
-                <p>Microphone integration for hands-free reporting (coming soon).</p>
-              </div>
-              <div className="feature">
-                <div className="feature-icon">📍</div>
-                <h3>Location Aware</h3>
-                <p>Precise location tagging for accurate issue mapping.</p>
-              </div>
-              <div className="feature">
-                <div className="feature-icon">⚡</div>
-                <h3>Instant AI Analysis</h3>
-                <p>Real-time categorization, severity assessment, and recommendations.</p>
-              </div>
-              <div className="feature">
-                <div className="feature-icon">🔒</div>
-                <h3>Privacy First</h3>
-                <p>Your data is secure and used only for community improvement.</p>
-              </div>
-              <div className="feature">
-                <div className="feature-icon">📈</div>
-                <h3>Community Insights</h3>
-                <p>Aggregate analytics help authorities spot trends and patterns.</p>
-              </div>
-            </div>
-          </div>
-        </section>
-      </main>
-
-      <footer className="footer">
+      {/* Pipeline --------------------------------------------------- */}
+      <section id="how-it-works" className="section pipeline">
         <div className="container">
-          <p>&copy; 2026 CivicAI. Built for hackathon demo.</p>
+          <header className="pipeline__head">
+            <div>
+              <span className="eyebrow">How it works</span>
+              <h2 className="pipeline__title">
+                From one report to a government decision
+              </h2>
+            </div>
+            <p className="pipeline__principle">
+              <strong>AI recommends. Government decides.</strong>
+              CivicAI organises evidence so officers can decide with a clear
+              picture. It never makes the decision.
+            </p>
+          </header>
+
+          <ol className="stage-rail">
+            {STAGES.map((stage, index) => (
+              <li className="stage" key={stage.title}>
+                <div className="stage__top">
+                  <span className="stage__number" aria-hidden="true">
+                    {String(index + 1).padStart(2, '0')}
+                  </span>
+                  <span className="stage__icon" aria-hidden="true">
+                    <stage.Icon size={19} />
+                  </span>
+                </div>
+                <h3 className="stage__title">{stage.title}</h3>
+                <p className="stage__body">{stage.body}</p>
+              </li>
+            ))}
+          </ol>
+
+          <div className="pipeline__cta">
+            <p className="pipeline__cta-text">
+              Seen a problem in your area? Reporting it takes under a minute.
+            </p>
+            <div className="pipeline__cta-actions">
+              <Link to="/complaint" className="btn btn--primary btn--lg">
+                Report an Issue
+              </Link>
+              <Link to="/login" className="btn btn--secondary btn--lg">
+                Sign In to Track Requests
+              </Link>
+            </div>
+          </div>
         </div>
-      </footer>
-    </div>
+      </section>
+    </PageShell>
   );
 }

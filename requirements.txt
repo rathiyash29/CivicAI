@@ -1,37 +1,47 @@
-# Core CivicAI backend dependencies.
-# Everything here installs and runs free of charge, locally. BigQuery is
-# deliberately NOT in this file -- see requirements-bigquery.txt.
+# CivicAI backend dependencies.
 #
-# Pinned versions are the ones already in use by the team. Packages added
-# during the Member 2 data-engine work use a `>=` floor instead of an exact
-# pin, so installing this file cannot downgrade a working environment.
+# This is the SINGLE canonical install manifest for the backend. Install
+# with:    pip install -r requirements.txt
+#
+# BigQuery is deliberately NOT here -- it is optional and has its own
+# requirements-bigquery.txt, which this file does not duplicate.
+#
+# Version floors are used instead of exact pins. The repo previously pinned
+# fastapi==0.115.0 / SQLAlchemy==2.0.35 / pandas==2.2.2, which are older than
+# the versions the team is actually running; installing those pins would
+# DOWNGRADE a working environment. Floors keep the file honest about what is
+# required while letting pip resolve to what is already installed.
+#
+# Test-only dependencies (pytest, httpx) are included because the backend
+# test suite is part of the product: `pip install -r requirements.txt` must be
+# enough to run `pytest`.
 
 # --- Web framework ---
-fastapi==0.115.0
-uvicorn[standard]==0.30.6
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.6
 python-multipart>=0.0.9          # required by FastAPI's OAuth2 form parsing
 
-# --- Auth (Member 1's auth.py) ---
+# --- Auth (backend/auth.py) ---
 python-jose[cryptography]>=3.3.0
 passlib>=1.7.4
 bcrypt>=4.0.0
 
 # --- Validation ---
-pydantic==2.9.2
-email-validator>=2.0.0           # pydantic's EmailStr requires this
+pydantic>=2.9.2
+email-validator>=2.0.0          # pydantic's EmailStr requires this
 
-# --- Database (Member 2) ---
-SQLAlchemy==2.0.35
-psycopg2-binary==2.9.9            # PostgreSQL driver
+# --- Database ---
+SQLAlchemy>=2.0.35
+psycopg2-binary>=2.9.9           # PostgreSQL driver
 
-# --- Data loading / analytics (Member 2) ---
-pandas==2.2.2
-requests==2.32.3
-python-dotenv==1.0.1
+# --- Data loading / analytics ---
+pandas>=2.2.2
+requests>=2.32.3
+python-dotenv>=1.0.1
 
-# --- Optional AI providers (Member 1) ---
+# --- Optional AI provider (backend/ai.py) ---
 google-genai>=1.0.0
 
-# --- Testing ---
+# --- Testing (part of the product: pytest + fastapi.testclient) ---
 pytest>=8.0.0
 httpx>=0.27.0                    # required by fastapi.testclient

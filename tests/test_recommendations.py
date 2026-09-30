@@ -5,6 +5,10 @@ from database import models
 REQUIRED_FIELDS = {
     "cluster_id", "location", "action", "reason", "evidence",
     "priority_score", "priority_level", "estimated_affected_population",
+    # The recommendation's own primary key, which is what the officer decision
+    # endpoints are called with. `cluster_id` stays the issue cluster this was
+    # generated from; the two are different things and both are needed.
+    "recommendation_id",
 }
 
 
@@ -96,6 +100,23 @@ def test_response_shape_is_preserved(clean_db):
     }
 
 
+def test_recommendation_id_is_the_stored_recommendation_not_the_cluster(clean_db):
+    """
+    The decision endpoints are keyed on `recommendation_id`, so it has to be the
+    Recommendation row's own primary key. Returning the cluster id here would
+    make an officer decision land on whichever recommendation happened to share
+    that number, which is exactly the confidently-wrong-result failure this
+    project keeps guarding against.
+    """
+    cluster = _cluster(clean_db)
+    rec = recommendations.generate_recommendation(clean_db, cluster)
+    stored = clean_db.query(models.Recommendation).filter_by(
+        cluster_id=cluster.id
+    ).one()
+    assert rec["recommendation_id"] == stored.id
+    assert rec["cluster_id"] == cluster.id
+
+
 # --- robustness ------------------------------------------------------------
 
 def test_cluster_with_unknown_ward_degrades_instead_of_crashing(clean_db):
@@ -129,3 +150,151 @@ def test_reason_reflects_the_evidence(clean_db):
     low = _cluster(clean_db, "Aundh", "Healthcare", priority=10.0)
     rec = recommendations.generate_recommendation(clean_db, low)
     assert "High demand" in rec["reason"]
+
+
+# --- empty clusters earn no recommendation ----------------------------------
+#
+# A cluster can be emptied after its complaints move elsewhere. Its complaint
+# row is untouched and stays in `issue_clusters`, but a recommendation built
+# from it says nothing an officer can act on, and a dashboard cannot tell
+# "Low priority, one complaint" from "this cluster is empty".
+
+
+def _empty_cluster(db, ward="Baner", category="Education"):
+    c = models.IssueCluster(label=f"empty {category}", category=category, ward=ward)
+    db.add(c)
+    db.commit()
+    return c
+
+
+def test_empty_cluster_gets_no_recommendation(clean_db):
+    _empty_cluster(clean_db)
+
+    results = recommendations.generate_all(clean_db)
+
+    assert results == []
+    assert clean_db.query(models.Recommendation).count() == 0
+
+
+def test_populated_cluster_gets_exactly_one_recommendation(clean_db):
+    _cluster(clean_db, "Kothrud", "Road Infrastructure", members=3)
+
+    results = recommendations.generate_all(clean_db)
+
+    assert len(results) == 1
+    assert results[0]["cluster_id"] is not None
+    assert clean_db.query(models.Recommendation).count() == 1
+
+
+def test_empty_and_populated_clusters_are_not_mixed(clean_db):
+    populated = _cluster(clean_db, "Kothrud", "Road Infrastructure", members=2)
+    _empty_cluster(clean_db, "Baner", "Education")
+    _empty_cluster(clean_db, "Aundh", "Healthcare")
+
+    results = recommendations.generate_all(clean_db)
+
+    assert [r["cluster_id"] for r in results] == [populated.id]
+    assert clean_db.query(models.Recommendation).count() == 1
+
+
+def test_empty_clusters_remain_in_issue_clusters(clean_db):
+    """The cluster is a real historical group; only its recommendation goes."""
+    cluster = _empty_cluster(clean_db)
+    _cluster(clean_db, "Kothrud", "Road Infrastructure", members=2)
+    before = clean_db.query(models.IssueCluster).count()
+
+    recommendations.generate_all(clean_db)
+
+    assert clean_db.query(models.IssueCluster).count() == before == 2
+    assert clean_db.query(models.IssueCluster).filter_by(id=cluster.id).one() is not None
+    assert clean_db.query(models.Complaint).count() == 2, "no complaint was touched"
+
+
+def test_repeated_generation_creates_no_duplicates(clean_db):
+    _cluster(clean_db, "Kothrud", "Road Infrastructure", members=2)
+    _empty_cluster(clean_db, "Baner", "Education")
+
+    recommendations.generate_all(clean_db)
+    recommendations.generate_all(clean_db)
+    recommendations.generate_all(clean_db)
+
+    assert clean_db.query(models.Recommendation).count() == 1
+
+
+def test_stale_recommendation_for_an_emptied_cluster_is_removed(clean_db):
+    """
+    The live-database case: a cluster had a recommendation while it had
+    complaints, then lost them. The row must not survive to be served as if it
+    still described real demand.
+    """
+    cluster = _cluster(clean_db, "Kothrud", "Road Infrastructure", members=3)
+    assert recommendations.generate_recommendation(clean_db, cluster) is not None
+    assert clean_db.query(models.Recommendation).count() == 1
+
+    for complaint in clean_db.query(models.Complaint).all():
+        complaint.cluster_id = None
+    clean_db.commit()
+
+    assert recommendations.generate_all(clean_db) == []
+    assert clean_db.query(models.Recommendation).count() == 0
+    assert clean_db.query(models.IssueCluster).count() == 1, "the cluster stays"
+
+
+def test_related_complaints_reflects_actual_membership(clean_db):
+    cluster = _cluster(clean_db, "Kothrud", "Road Infrastructure", members=4)
+
+    rec = recommendations.generate_all(clean_db)[0]
+
+    actual = clean_db.query(models.Complaint).filter_by(cluster_id=cluster.id).count()
+    assert rec["evidence"]["related_complaints"] == actual == 4
+
+
+def test_related_complaints_ignores_a_stale_cached_count(clean_db):
+    """Membership is counted, not read from the cache."""
+    cluster = _cluster(clean_db, "Kothrud", "Road Infrastructure", members=2)
+    cluster.complaint_count = 99
+    clean_db.commit()
+
+    rec = recommendations.generate_all(clean_db)[0]
+
+    assert rec["evidence"]["related_complaints"] == 2
+
+
+def test_cluster_with_only_a_fake_cache_count_is_treated_as_empty(clean_db):
+    """A cached count must not be able to conjure a recommendation."""
+    cluster = _empty_cluster(clean_db)
+    cluster.complaint_count = 25
+    clean_db.commit()
+
+    assert recommendations.cluster_has_members(clean_db, cluster) is False
+    assert recommendations.generate_all(clean_db) == []
+    assert clean_db.query(models.Recommendation).count() == 0
+
+
+def test_priority_and_evidence_come_from_actual_members(clean_db):
+    cluster = _cluster(clean_db, "Kothrud", "Road Infrastructure",
+                       members=3, priority=90.0)
+
+    rec = recommendations.generate_all(clean_db)[0]
+
+    assert rec["priority_score"] == 90.0
+    assert rec["priority_level"] == "High"
+    assert rec["evidence"]["related_complaints"] == 3
+    assert rec["evidence"]["high_severity_complaints"] == 3, "fixture uses High severity"
+
+
+def test_recommendation_referenced_by_a_project_is_not_deleted(clean_db):
+    """An approved recommendation is the record of a real officer decision."""
+    cluster = _cluster(clean_db, "Kothrud", "Road Infrastructure", members=2)
+    recommendations.generate_recommendation(clean_db, cluster)
+    rec = clean_db.query(models.Recommendation).one()
+    clean_db.add(models.Project(title="Approved work", recommendation_id=rec.id,
+                                status="Approved"))
+    for complaint in clean_db.query(models.Complaint).all():
+        complaint.cluster_id = None
+    clean_db.commit()
+
+    recommendations.generate_all(clean_db)
+
+    assert clean_db.query(models.Recommendation).count() == 1, \
+        "a recommendation backing a project must survive its cluster emptying"

@@ -6,7 +6,7 @@ interface AuthContextType {
   user: User | null;
   isLoading: boolean;
   login: (email: string, password: string) => Promise<void>;
-  register: (data: { full_name: string; email: string; password: string; role?: 'citizen' | 'officer' }) => Promise<void>;
+  register: (data: { full_name: string; email: string; password: string }) => Promise<void>;
   logout: () => void;
   isAuthenticated: boolean;
 }
@@ -43,7 +43,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setUser(userData);
   };
 
-  const register = async (data: { full_name: string; email: string; password: string; role?: 'citizen' | 'officer' }) => {
+  /**
+   * Register a citizen account.
+   *
+   * The payload carries no `role`: the public registration route creates
+   * citizens only and rejects any request that asks for anything else, so the
+   * role cannot be chosen from here. Officer accounts are provisioned out of
+   * band.
+   */
+  const register = async (data: { full_name: string; email: string; password: string }) => {
     const { registerUser, loginUser, saveAuthToken } = await import('../api/auth');
     await registerUser(data);
     const tokens = await loginUser({ email: data.email, password: data.password });

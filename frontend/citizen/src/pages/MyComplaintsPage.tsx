@@ -3,11 +3,35 @@ import { Link, useNavigate } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import { getMyComplaints, type Complaint } from '../api/complaints';
 import { getAuthToken } from '../api/auth';
+import { PageShell } from '../components/PageShell';
+import { IconAlert, IconArrowRight, IconClock, IconInbox } from '../components/Icons';
 import './MyComplaintsPage.css';
+
+/**
+ * Badge tone per status.
+ *
+ * Only statuses the service actually returns are styled; anything unrecognised
+ * falls through to a neutral badge rather than being guessed at, and the status
+ * string itself is always rendered verbatim from the payload.
+ */
+const STATUS_TONE: Record<string, string> = {
+  Submitted: 'info',
+  'Under Review': 'warning',
+  'In Progress': 'info',
+  Completed: 'success',
+  Resolved: 'success',
+  Rejected: 'danger',
+};
+
+const PRIORITY_TONE: Record<string, string> = {
+  High: 'danger',
+  Medium: 'warning',
+  Low: 'success',
+};
 
 export function MyComplaintsPage() {
   const navigate = useNavigate();
-  const { user, isAuthenticated, isLoading: authLoading, logout } = useAuth();
+  const { isAuthenticated, isLoading: authLoading, logout } = useAuth();
   const [complaints, setComplaints] = useState<Complaint[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -15,7 +39,7 @@ export function MyComplaintsPage() {
   const fetchComplaints = useCallback(async () => {
     const token = getAuthToken();
     if (!token) {
-      setError('Authentication required');
+      setError('Please sign in to view your requests.');
       setIsLoading(false);
       return;
     }
@@ -28,7 +52,7 @@ export function MyComplaintsPage() {
       if (err instanceof Error) {
         setError(err.message);
       } else {
-        setError('Failed to load complaints');
+        setError('Could not load your requests.');
       }
     } finally {
       setIsLoading(false);
@@ -56,34 +80,14 @@ export function MyComplaintsPage() {
     });
   };
 
-  const getPriorityColor = (level?: string) => {
-    switch (level) {
-      case 'High': return '#dc2626';
-      case 'Medium': return '#f59e0b';
-      case 'Low': return '#16a34a';
-      default: return '#64748b';
-    }
-  };
-
-  const getStatusColor = (status: string) => {
-    switch (status) {
-      case 'Submitted': return '#2563eb';
-      case 'Under Review': return '#f59e0b';
-      case 'In Progress': return '#8b5cf6';
-      case 'Resolved': return '#16a34a';
-      case 'Rejected': return '#dc2626';
-      default: return '#64748b';
-    }
-  };
-
   if (authLoading) {
     return (
-      <div className="my-complaints-page">
-        <div className="loading-container">
-          <div className="spinner-large"></div>
-          <p>Loading...</p>
+      <PageShell>
+        <div className="loading-panel">
+          <span className="spinner" aria-hidden="true" />
+          <p>Loading your requests…</p>
         </div>
-      </div>
+      </PageShell>
     );
   }
 
@@ -92,124 +96,147 @@ export function MyComplaintsPage() {
   }
 
   return (
-    <div className="my-complaints-page">
-      <header className="header">
+    <PageShell>
+      <div className="page-head">
         <div className="container">
-          <div className="logo">CivicAI</div>
-          <nav className="nav">
-            <Link to="/" className="nav-link">Home</Link>
-            <Link to="/complaint" className="nav-link">Report a Problem</Link>
-            <span className="user-info" style={{ color: '#64748b', marginRight: '1rem', fontSize: '0.9rem' }}>
-              {user?.full_name} ({user?.role})
-            </span>
-            <button onClick={logout} className="btn btn-secondary" style={{ padding: '0.5rem 1rem', fontSize: '0.875rem' }}>
-              Logout
-            </button>
+          <nav className="breadcrumb" aria-label="Breadcrumb">
+            <span>CivicAI</span>
+            <span className="breadcrumb__sep" aria-hidden="true">/</span>
+            <span>Citizen Portal</span>
+            <span className="breadcrumb__sep" aria-hidden="true">/</span>
+            <span aria-current="page">My Requests</span>
           </nav>
-        </div>
-      </header>
 
-      <main className="main">
-        <div className="container">
-          <div className="page-header">
-            <h1>My Complaints</h1>
-            <p className="subtitle">Track the status of complaints you've submitted</p>
+          <div className="requests__head">
+            <div>
+              <h1 className="page-head__title">My Requests</h1>
+              <p className="page-head__lead">
+                Track the issues you have reported and their current status.
+              </p>
+            </div>
+            <div className="requests__head-actions">
+              <Link to="/complaint" className="btn btn--primary btn--sm">
+                Report an Issue
+              </Link>
+              <button
+                type="button"
+                className="btn btn--secondary btn--sm"
+                onClick={logout}
+              >
+                Log out
+              </button>
+            </div>
           </div>
+        </div>
+      </div>
 
+      <section className="section section--tight">
+        <div className="container requests">
           {error && (
-            <div className="error-banner" role="alert">
+            <div className="alert alert--error" role="alert">
+              <span className="alert__icon" aria-hidden="true"><IconAlert size={18} /></span>
               <span>{error}</span>
-              <button onClick={fetchComplaints} className="btn btn-secondary btn-small">Retry</button>
+              <button
+                type="button"
+                className="btn btn--secondary btn--sm"
+                onClick={fetchComplaints}
+              >
+                Retry
+              </button>
             </div>
           )}
 
           {isLoading ? (
-            <div className="loading-container">
-              <div className="spinner"></div>
-              <p>Loading your complaints...</p>
+            <div className="loading-panel">
+              <span className="spinner" aria-hidden="true" />
+              <p>Loading your requests…</p>
             </div>
           ) : complaints.length === 0 ? (
             <div className="empty-state">
-              <div className="empty-icon">📋</div>
-              <h2>No Complaints Yet</h2>
-              <p>You haven't submitted any complaints yet.</p>
-              <Link to="/complaint" className="btn btn-primary btn-large">
-                Report Your First Problem
+              <span className="empty-state__icon" aria-hidden="true">
+                <IconInbox size={22} />
+              </span>
+              <h2>No requests yet</h2>
+              <p>
+                You have not reported an issue yet. When you do, you will be able to
+                follow its status here.
+              </p>
+              <Link to="/complaint" className="btn btn--primary">
+                Report Your First Issue
               </Link>
             </div>
           ) : (
-            <div className="complaints-list">
+            <ul className="request-list">
               {complaints.map((complaint) => (
-                <article key={complaint.complaint_id} className="complaint-card">
-                  <div className="complaint-header">
-                    <div className="complaint-id-section">
-                      <span className="complaint-id">{complaint.complaint_id}</span>
-                      <span 
-                        className="status-badge" 
-                        style={{ backgroundColor: getStatusColor(complaint.status), color: '#fff' }}
-                      >
-                        {complaint.status}
-                      </span>
-                    </div>
-                    <time className="complaint-date" dateTime={complaint.created_at}>
-                      {formatDate(complaint.created_at)}
-                    </time>
-                  </div>
-
-                  <div className="complaint-body">
-                    <p className="complaint-text">{complaint.text}</p>
-                    
-                    <div className="complaint-meta">
-                      <div className="meta-item">
-                        <span className="meta-label">Location</span>
-                        <span className="meta-value">{complaint.location}</span>
+                <li key={complaint.complaint_id}>
+                  <article className="card request">
+                    <div className="request__head">
+                      <div className="request__ident">
+                        <span className="request__id">{complaint.complaint_id}</span>
+                        <span className={`badge badge--${STATUS_TONE[complaint.status] ?? 'neutral'}`}>
+                          {complaint.status}
+                        </span>
                       </div>
-                      {complaint.category && (
-                        <div className="meta-item">
-                          <span className="meta-label">Category</span>
-                          <span className="meta-value">{complaint.category}</span>
-                        </div>
-                      )}
-                      {complaint.severity && (
-                        <div className="meta-item">
-                          <span className="meta-label">Severity</span>
-                          <span className="meta-value">{complaint.severity}</span>
-                        </div>
-                      )}
-                      {complaint.priority_score !== undefined && complaint.priority_level && (
-                        <div className="meta-item priority-item">
-                          <span className="meta-label">Priority</span>
-                          <span 
-                            className="meta-value priority-value"
-                            style={{ color: getPriorityColor(complaint.priority_level) }}
-                          >
-                            {complaint.priority_score} ({complaint.priority_level})
-                          </span>
-                        </div>
-                      )}
+                      <time className="request__date" dateTime={complaint.created_at}>
+                        <IconClock size={14} aria-hidden="true" />
+                        {formatDate(complaint.created_at)}
+                      </time>
                     </div>
-                  </div>
 
-                  <div className="complaint-footer">
-                    <Link 
-                      to={`/analysis?complaint_id=${complaint.complaint_id}`} 
-                      className="btn btn-secondary btn-small"
-                    >
-                      View Details
-                    </Link>
-                  </div>
-                </article>
+                    <p className="request__text">{complaint.text}</p>
+
+                    <dl className="request__meta">
+                      {complaint.location ? (
+                        <div className="request__meta-item">
+                          <dt>Location</dt>
+                          <dd>{complaint.location}</dd>
+                        </div>
+                      ) : null}
+                      {complaint.category ? (
+                        <div className="request__meta-item">
+                          <dt>Category</dt>
+                          <dd>{complaint.category}</dd>
+                        </div>
+                      ) : null}
+                      {complaint.severity ? (
+                        <div className="request__meta-item">
+                          <dt>Severity</dt>
+                          <dd>
+                            <span className={`badge badge--${PRIORITY_TONE[complaint.severity] ?? 'neutral'}`}>
+                              {complaint.severity}
+                            </span>
+                          </dd>
+                        </div>
+                      ) : null}
+                      {complaint.priority_score !== undefined && complaint.priority_level ? (
+                        <div className="request__meta-item">
+                          <dt>Priority</dt>
+                          <dd>
+                            {complaint.priority_score}{' '}
+                            <span className={`badge badge--${PRIORITY_TONE[complaint.priority_level] ?? 'neutral'}`}>
+                              {complaint.priority_level}
+                            </span>
+                          </dd>
+                        </div>
+                      ) : null}
+                    </dl>
+
+                    <div className="request__foot">
+                      <Link
+                        to={`/analysis?complaint_id=${complaint.complaint_id}`}
+                        className="btn btn--secondary btn--sm"
+                      >
+                        View Details
+                        <IconArrowRight size={15} />
+                      </Link>
+                    </div>
+                  </article>
+                </li>
               ))}
-            </div>
+            </ul>
           )}
         </div>
-      </main>
-
-      <footer className="footer">
-        <div className="container">
-          <p>&copy; 2026 CivicAI. Built for hackathon demo.</p>
-        </div>
-      </footer>
-    </div>
+      </section>
+    </PageShell>
   );
 }

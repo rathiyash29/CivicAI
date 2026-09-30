@@ -74,11 +74,23 @@ def get_demand_group_count(db: Session, complaint: models.Complaint) -> Tuple[in
     A clustered complaint is measured by its whole cluster, because that is
     the unit the officer dashboard actually acts on. An unclustered one is
     measured against every complaint sharing its location and category.
+
+    The cluster size is counted from the complaints that actually point at the
+    cluster, not read from `IssueCluster.complaint_count`. That column is a
+    cache maintained by the clustering code, and a complaint repointed outside
+    that code (a data reload, a manual fix) leaves it stale -- which would then
+    feed a wrong demand score straight into every complaint in the cluster.
+    Counting the members is one extra query and cannot drift.
     """
     if complaint.cluster_id:
         cluster = db.query(models.IssueCluster).filter_by(id=complaint.cluster_id).first()
-        if cluster is not None and cluster.complaint_count:
-            return int(cluster.complaint_count), "cluster"
+        if cluster is not None:
+            # Always at least 1 (the complaint itself), so this cannot return
+            # zero; the guard is only there to keep a corrupt cluster_id from
+            # producing a demand of 0.
+            members = db.query(models.Complaint).filter_by(cluster_id=cluster.id).count()
+            if members:
+                return int(members), "cluster"
 
     query = db.query(models.Complaint).filter(models.Complaint.category == complaint.category)
     if complaint.location_id:

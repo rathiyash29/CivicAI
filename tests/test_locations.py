@@ -141,3 +141,60 @@ def test_resolver_never_invents_a_row_for_a_short_fragment(clean_db, wards):
         assert locations.resolve_location(clean_db, junk) is None
     clean_db.commit()
     assert clean_db.query(models.Location).count() == before
+
+
+# --- comma-separated locality labels ---------------------------------------
+#
+# `Location.area` holds "ward, locality, locality" (see
+# `data.data_loader.ward_area_label`), so a citizen who types a neighbourhood
+# name resolves to the same ward as one who types the ward name.
+
+@pytest.fixture
+def aliased_wards(clean_db):
+    # Exactly one row per ward, carrying the comma-separated label shape the
+    # loader writes. Two rows for the same ward would be genuine ambiguity and
+    # would make these tests pass or fail for the wrong reason.
+    clean_db.add(models.Location(
+        ward="Kothrud", area="Kothrud, Sukhsagar Nagar, Sukhsagarnagar", city="Pune"))
+    clean_db.add(models.Location(ward="Hadapsar", area="Hadapsar, Bibvewadi", city="Pune"))
+    clean_db.commit()
+    return True
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("sukhsagarnagar,Pune", "Kothrud"),
+    ("Sukhsagar Nagar", "Kothrud"),
+    ("bibvewadi,Pune", "Hadapsar"),
+    ("Bibvewadi", "Hadapsar"),
+    # The ward's own name still resolves, with or without the city token.
+    ("Kothrud", "Kothrud"),
+    ("Kothrud, Pune", "Kothrud"),
+])
+def test_locality_aliases_resolve_to_their_ward(clean_db, aliased_wards, raw, expected):
+    loc = locations.resolve_location(clean_db, raw)
+    assert loc is not None and loc.ward == expected
+
+
+def test_a_bare_city_name_never_resolves(clean_db, aliased_wards):
+    """
+    A city is not a ward. If a locality entry ever carried a city name, the
+    comma split would make that city an alias and every "Pune" complaint would
+    silently land in an arbitrary ward.
+    """
+    for raw in ["Pune", "Pune, Maharashtra", "near Pune"]:
+        assert locations.resolve_location(clean_db, raw) is None
+
+
+def test_locality_aliases_do_not_create_location_rows(clean_db, aliased_wards):
+    before = clean_db.query(models.Location).count()
+    for raw in ["Sukhsagar Nagar", "Bibvewadi", "sukhsagarnagar,Pune"]:
+        locations.resolve_location(clean_db, raw)
+    clean_db.commit()
+    assert clean_db.query(models.Location).count() == before
+
+
+def test_a_single_valued_area_behaves_exactly_as_before(clean_db, wards):
+    """Splitting on commas must not change a plain area like 'Paud Road'."""
+    loc = locations.resolve_location(clean_db, "Paud Road")
+    assert loc is not None and loc.ward == "Kothrud"
+    assert locations.resolve_location(clean_db, "Sahyadri Nagar").ward == "Hadapsar"

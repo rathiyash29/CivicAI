@@ -140,3 +140,75 @@ def test_loader_does_not_require_network(clean_db, monkeypatch):
 
     monkeypatch.setattr(requests, "get", explode)
     data_loader.load_all()  # must not raise
+
+
+# --- ward localities --------------------------------------------------------
+#
+# The curated locality -> ward table is what lets a complaint written against a
+# neighbourhood name ("sukhsagarnagar") resolve to a ward at all. It is data, so
+# it gets the same honesty checks as everything else the loader writes.
+
+def test_locality_table_is_valid():
+    data_loader.validate_localities()
+
+
+def test_every_locality_belongs_to_a_known_ward():
+    assert set(data_loader.WARD_LOCALITIES) <= set(data_loader.PUNE_WARDS)
+
+
+def test_localities_never_contain_a_city_or_ward_name():
+    """A city name here would become a bare alias and hijack every 'Pune'."""
+    wards = {w.lower() for w in data_loader.PUNE_WARDS}
+    for ward, localities in data_loader.WARD_LOCALITIES.items():
+        for locality in localities:
+            key = locality.strip().lower()
+            assert key not in data_loader.NON_LOCALITY_NAMES
+            assert key not in wards
+
+
+def test_required_localities_are_present():
+    """The two localities the live complaints actually reference."""
+    assert "Sukhsagar Nagar" in data_loader.WARD_LOCALITIES["Kothrud"]
+    assert "Bibvewadi" in data_loader.WARD_LOCALITIES["Hadapsar"]
+
+
+def test_area_column_carries_the_ward_name_plus_its_localities(clean_db):
+    data_loader.load_all()
+    kothrud = clean_db.query(models.Location).filter_by(ward="Kothrud").first()
+    parts = [p.strip() for p in kothrud.area.split(",")]
+    assert parts[0] == "Kothrud"
+    assert "Sukhsagar Nagar" in parts
+
+
+def test_localities_reach_the_resolver_through_the_database(clean_db):
+    """End to end: loader -> locations table -> resolver, no shortcut."""
+    from backend import locations
+
+    data_loader.load_all()
+    for raw, expected in [
+        ("sukhsagarnagar,Pune", "Kothrud"),
+        ("bibvewadi,Pune", "Hadapsar"),
+        ("Pune", None),
+    ]:
+        loc = locations.resolve_location(clean_db, raw)
+        assert (loc.ward if loc else None) == expected
+
+
+def test_validate_localities_rejects_a_city_name():
+    original = data_loader.WARD_LOCALITIES
+    data_loader.WARD_LOCALITIES = {"Kothrud": ["Pune"]}
+    try:
+        with pytest.raises(ValueError, match="city/district"):
+            data_loader.validate_localities()
+    finally:
+        data_loader.WARD_LOCALITIES = original
+
+
+def test_validate_localities_rejects_a_ward_name():
+    original = data_loader.WARD_LOCALITIES
+    data_loader.WARD_LOCALITIES = {"Kothrud": ["Baner"]}
+    try:
+        with pytest.raises(ValueError, match="already a ward name"):
+            data_loader.validate_localities()
+    finally:
+        data_loader.WARD_LOCALITIES = original

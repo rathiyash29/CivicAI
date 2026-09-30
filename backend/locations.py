@@ -68,6 +68,31 @@ def _matches_words(needle: str, haystack: str) -> bool:
     return _contains_token_run(haystack_tokens, needle_tokens)
 
 
+def _aliases(field: Optional[str]) -> list[str]:
+    """
+    One `Location` field, split into the separate names it can match.
+
+    `Location.area` holds a comma-separated label: the ward's own name followed
+    by any curated localities it administers, written by
+    `data.data_loader.ward_area_label`. A citizen who types a neighbourhood
+    name ("sukhsagarnagar") must resolve to the same ward as one who types the
+    ward ("Kothrud"), so every comma-separated part is an independent candidate
+    for a match.
+
+    A field with no comma is returned unchanged, so a plain single-valued area
+    behaves exactly as it did before.
+    """
+    if not field:
+        return []
+    parts = [part.strip() for part in field.split(",")]
+    return [part for part in parts if part]
+
+
+def _matchable_fields(loc: models.Location) -> list[str]:
+    """Every name a citizen could type that legitimately means this location."""
+    return [*_aliases(loc.ward), *_aliases(loc.area)]
+
+
 def _known_locations(db: Session) -> list[models.Location]:
     return db.query(models.Location).order_by(models.Location.id).all()
 
@@ -92,10 +117,10 @@ def resolve_location(db: Session, raw_location: str) -> Optional[models.Location
     if not locations:
         return None
 
-    # 1. exact match
+    # 1. exact match, against every name the location is known by
     for loc in locations:
-        for field in (loc.ward, loc.area):
-            if field and normalize(field) == needle:
+        for field in _matchable_fields(loc):
+            if normalize(field) == needle:
                 return loc
 
     # 2. substring match, on whole words only and only for text long enough to
@@ -109,7 +134,7 @@ def resolve_location(db: Session, raw_location: str) -> Optional[models.Location
     for loc in locations:
         if loc in candidates:
             continue
-        for field in (loc.ward, loc.area):
+        for field in _matchable_fields(loc):
             if not field:
                 continue
             haystack = normalize(field)
