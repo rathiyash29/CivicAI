@@ -15,7 +15,7 @@ import { CaseThreadPage } from './pages/CaseThreadPage'
 function App() {
   return (
     <AuthProvider>
-      <BrowserRouter>
+      <BrowserRouter basename="/government">
         <Routes>
           <Route path="/login" element={<LoginPage />} />
           <Route path="/access-denied" element={<AccessDeniedPage />} />

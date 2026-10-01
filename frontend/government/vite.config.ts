@@ -15,6 +15,13 @@ export default defineConfig(({ mode }) => {
 
   return {
     plugins: [react()],
+    // The officer dashboard is served under /government/ on the citizen
+    // deployment (https://civicai-liart.vercel.app/government), which the
+    // citizen Vercel build rewrites to this app's own deployment. Setting the
+    // Vite base here makes every asset URL in the built index.html start with
+    // /government/, so static assets load correctly through that prefix. The
+    // dev and preview servers serve the same base path.
+    base: '/government/',
     server: {
       port: 5174,
       strictPort: false,

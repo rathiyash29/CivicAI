@@ -1,0 +1,8 @@
+{
+  "rewrites": [
+    {
+      "source": "/government(.*)",
+      "destination": "https://civic-ai-tawny-ten.vercel.app$1"
+    }
+  ]
+}
